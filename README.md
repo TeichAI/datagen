@@ -5,8 +5,7 @@ A easy to use CLI to generate JSONL datasets from a TXT file using LLMs.
 ## Install
 
 ```bash
-npm install
-npm run build
+npm i @teichai/datagen
 ```
 
 Run tests:
