@@ -2,6 +2,64 @@ import { createReadStream, createWriteStream, promises as fs } from "node:fs";
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import { countNonEmptyLines, ProgressBar } from "./progress.js";
+import {
+  calculateOpenRouterSpendUSD,
+  getOpenRouterModelPricing,
+  isOpenRouterApiBase,
+  type OpenRouterModelPricing,
+  type OpenRouterUsage
+} from "./openrouter.js";
+
+function trimTrailingZeros(num: string): string {
+  if (!num.includes(".")) return num;
+  const trimmed = num.replace(/(?:\.0+|(\.\d*?)0+)$/, "$1");
+  return trimmed.endsWith(".") ? trimmed.slice(0, -1) : trimmed;
+}
+
+function formatUsdRate(raw: string | undefined, fallback: number): string {
+  if (typeof raw === "string" && raw.trim().length > 0) return `$${trimTrailingZeros(raw)}`;
+  if (!Number.isFinite(fallback)) return "$0";
+  const abs = Math.abs(fallback);
+  const decimals = abs >= 0.01 ? 6 : 10;
+  return `$${trimTrailingZeros(fallback.toFixed(decimals))}`;
+}
+
+function formatUsd(amount: number): string {
+  if (!Number.isFinite(amount)) return "$0";
+  const abs = Math.abs(amount);
+  if (abs === 0) return "$0";
+  const decimals = abs >= 10 ? 2 : abs >= 1 ? 4 : abs >= 0.01 ? 6 : abs >= 0.0001 ? 8 : 10;
+  const rounded = Number(amount.toFixed(decimals));
+  if (rounded === 0) {
+    const min = 1 / 10 ** decimals;
+    const minLabel = trimTrailingZeros(min.toFixed(decimals));
+    return amount < 0 ? `>-$${minLabel}` : `<$${minLabel}`;
+  }
+  return `$${trimTrailingZeros(amount.toFixed(decimals))}`;
+}
+
+function formatUsdPerMillionTokens(
+  known: boolean,
+  rawPerToken: string | undefined,
+  fallbackPerToken: number
+): string {
+  if (!known) return "unknown/1M tok";
+  const perToken =
+    typeof rawPerToken === "string" && rawPerToken.trim().length > 0
+      ? Number(rawPerToken)
+      : fallbackPerToken;
+  const perMillion = (Number.isFinite(perToken) ? perToken : 0) * 1_000_000;
+  return `${formatUsd(perMillion)}/1M tok`;
+}
+
+function formatUsdOrUnknown(
+  known: boolean,
+  raw: string | undefined,
+  fallback: number
+): string {
+  if (!known) return "unknown";
+  return formatUsdRate(raw, fallback);
+}
 
 export type Args = {
   model: string;
@@ -106,7 +164,7 @@ export async function callOpenRouter(
   model: string,
   systemPrompt: string,
   userPrompt: string
-): Promise<{ content: string; reasoning?: string }> {
+): Promise<{ content: string; reasoning?: string; usage?: OpenRouterUsage }> {
   const url = `${apiBase.replace(/\/$/, "")}/chat/completions`;
   const messages = buildRequestMessages(systemPrompt, userPrompt);
 
@@ -137,12 +195,13 @@ export async function callOpenRouter(
     choice?.reasoning ??
     data?.reasoning ??
     undefined;
+  const usage = data?.usage as OpenRouterUsage | undefined;
 
   if (typeof content !== "string" || !content.length) {
     throw new Error("No assistant content returned from OpenRouter.");
   }
 
-  return { content, reasoning };
+  return { content, reasoning, usage };
 }
 
 export async function ensureReadableFile(filePath: string) {
@@ -212,6 +271,46 @@ export async function main(argv = process.argv.slice(2)) {
   const bar =
     useProgress && totalPrompts > 0 ? new ProgressBar(totalPrompts, process.stderr) : null;
 
+  const isOpenRouter = isOpenRouterApiBase(apiBase);
+  let pricing: OpenRouterModelPricing | null = null;
+  if (isOpenRouter) {
+    try {
+      pricing = await getOpenRouterModelPricing(apiBase, apiKey, model);
+      if (!pricing) {
+        const msg = `WARN: Could not find pricing for model "${model}" on OpenRouter.`;
+        if (bar) bar.writeLine(msg);
+        else process.stderr.write(msg + "\n");
+      }
+    } catch (err: any) {
+      const msg = `WARN: Failed to fetch OpenRouter models/pricing: ${err?.message ?? String(err)}`;
+      if (bar) bar.writeLine(msg);
+      else process.stderr.write(msg + "\n");
+    }
+  }
+
+  if (pricing) {
+    const lines = [
+      `Model: ${model}`,
+      `API: ${apiBase}`,
+      pricing.modelId !== model
+        ? `OpenRouter pricing model: ${pricing.modelId}`
+        : null,
+      `Pricing (USD per 1M tokens): prompt=${formatUsdPerMillionTokens(pricing.known.prompt, pricing.raw.prompt, pricing.promptPerTokenUSD)} completion=${formatUsdPerMillionTokens(pricing.known.completion, pricing.raw.completion, pricing.completionPerTokenUSD)}`,
+      `Pricing (USD per token): prompt=${formatUsdOrUnknown(pricing.known.prompt, pricing.raw.prompt, pricing.promptPerTokenUSD)}/token completion=${formatUsdOrUnknown(pricing.known.completion, pricing.raw.completion, pricing.completionPerTokenUSD)}/token`,
+      ` `
+    ].filter((l): l is string => Boolean(l));
+    for (const l of lines) {
+      if (bar) bar.writeLine(l);
+      else process.stderr.write(l + "\n");
+    }
+
+    if (!pricing.known.prompt || !pricing.known.completion) {
+      const msg = "WARN: OpenRouter did not provide token pricing for this model; spent total will be omitted.";
+      if (bar) bar.writeLine(msg);
+      else process.stderr.write(msg + "\n");
+    }
+  }
+
   const rl = createInterface({
     input: createReadStream(absPromptsPath),
     crlfDelay: Infinity
@@ -223,7 +322,11 @@ export async function main(argv = process.argv.slice(2)) {
   let processed = 0;
   let okCount = 0;
   let errCount = 0;
-  if (bar) bar.render(0, { ok: 0, err: 0 });
+  let spentUsd = 0;
+  const canTrackSpend = Boolean(
+    pricing && pricing.known.prompt && pricing.known.completion && pricing.known.request
+  );
+  if (bar) bar.render(0, { ok: 0, err: 0, spentUsd: canTrackSpend ? spentUsd : undefined });
 
   for await (const line of rl) {
     lineNum++;
@@ -231,13 +334,14 @@ export async function main(argv = process.argv.slice(2)) {
     if (!prompt) continue;
 
     try {
-      const { content, reasoning } = await callOpenRouter(
+      const { content, reasoning, usage } = await callOpenRouter(
         apiBase,
         apiKey,
         model,
         systemPrompt,
         prompt
       );
+      if (canTrackSpend && pricing) spentUsd += calculateOpenRouterSpendUSD(pricing, usage);
 
       const assistantContent = formatAssistantContent(content, reasoning);
       const messages = buildOutputMessages(
@@ -259,10 +363,22 @@ export async function main(argv = process.argv.slice(2)) {
       else process.stderr.write(msg + "\n");
     } finally {
       processed++;
-      if (bar) bar.render(processed, { ok: okCount, err: errCount });
+      if (bar) {
+        bar.render(processed, {
+          ok: okCount,
+          err: errCount,
+          spentUsd: canTrackSpend ? spentUsd : undefined
+        });
+      }
     }
   }
 
   out.end();
-  if (bar) bar.finish(processed, { ok: okCount, err: errCount });
+  if (bar) {
+    bar.finish(processed, {
+      ok: okCount,
+      err: errCount,
+      spentUsd: canTrackSpend ? spentUsd : undefined
+    });
+  }
 }

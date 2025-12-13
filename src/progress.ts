@@ -27,7 +27,27 @@ function formatDuration(ms: number): string {
   return `${seconds}s`;
 }
 
-export type ProgressStats = { ok: number; err: number };
+export type ProgressStats = { ok: number; err: number; spentUsd?: number };
+
+function trimTrailingZeros(num: string): string {
+  if (!num.includes(".")) return num;
+  const trimmed = num.replace(/(?:\.0+|(\.\d*?)0+)$/, "$1");
+  return trimmed.endsWith(".") ? trimmed.slice(0, -1) : trimmed;
+}
+
+function formatUSD(amount: number): string {
+  if (!Number.isFinite(amount)) return "$0";
+  const abs = Math.abs(amount);
+  if (abs === 0) return "$0";
+  const decimals = abs >= 10 ? 2 : abs >= 1 ? 4 : abs >= 0.01 ? 6 : abs >= 0.0001 ? 8 : 10;
+  const rounded = Number(amount.toFixed(decimals));
+  if (rounded === 0) {
+    const min = 1 / 10 ** decimals;
+    const minLabel = trimTrailingZeros(min.toFixed(decimals));
+    return amount < 0 ? `>-$${minLabel}` : `<$${minLabel}`;
+  }
+  return `$${trimTrailingZeros(amount.toFixed(decimals))}`;
+}
 
 export class ProgressBar {
   private readonly total: number;
@@ -62,8 +82,12 @@ export class ProgressBar {
     const columns = typeof this.stream.columns === "number" ? this.stream.columns : 80;
     const suffixBase = ` ${safeCurrent}/${this.total}`;
     const suffixStats = stats ? ` ok=${stats.ok} err=${stats.err}` : "";
+    const suffixMoney =
+      stats && typeof stats.spentUsd === "number"
+        ? ` spent=${formatUSD(stats.spentUsd)}`
+        : "";
     const suffixTime = ` ${formatDuration(Date.now() - this.start)}`;
-    const suffix = suffixBase + suffixStats + suffixTime;
+    const suffix = suffixBase + suffixStats + suffixMoney + suffixTime;
 
     const barWidth = Math.max(10, Math.min(40, columns - suffix.length - 10));
     const filled = Math.round(barWidth * pct);
@@ -82,4 +106,3 @@ export class ProgressBar {
     this.stream.write("\n");
   }
 }
-
