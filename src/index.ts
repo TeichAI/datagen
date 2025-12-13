@@ -401,12 +401,6 @@ export async function main(argv = process.argv.slice(2)) {
       spentUsd: canTrackSpend ? spentUsd : undefined
     });
 
-  const results = new Map<
-    number,
-    { lineNum: number; record?: any; errorMsg?: string }
-  >();
-  let nextToWrite = 0;
-
   const inFlight = new Set<Promise<void>>();
   const maxConcurrent = Math.max(1, concurrent);
 
@@ -417,22 +411,6 @@ export async function main(argv = process.argv.slice(2)) {
       err: errCount,
       spentUsd: canTrackSpend ? spentUsd : undefined
     });
-  };
-
-  const flushWrites = () => {
-    while (results.has(nextToWrite)) {
-      const r = results.get(nextToWrite)!;
-      results.delete(nextToWrite);
-
-      if (r.record) {
-        out.write(JSON.stringify(r.record) + "\n");
-      } else if (r.errorMsg) {
-        if (bar) bar.writeLine(r.errorMsg);
-        else process.stderr.write(r.errorMsg + "\n");
-      }
-
-      nextToWrite++;
-    }
   };
 
   const schedule = (index: number, line: number, prompt: string) => {
@@ -460,15 +438,15 @@ export async function main(argv = process.argv.slice(2)) {
           storeSystem
         );
 
-        results.set(index, { lineNum: line, record: { messages } });
+        out.write(JSON.stringify({ messages }) + "\n");
         okCount++;
       } catch (err: any) {
         const msg = `ERR line ${line}: ${err?.message ?? String(err)}`;
-        results.set(index, { lineNum: line, errorMsg: msg });
+        if (bar) bar.writeLine(msg);
+        else process.stderr.write(msg + "\n");
         errCount++;
       } finally {
         completed++;
-        flushWrites();
         renderProgress();
       }
     })();
@@ -497,7 +475,6 @@ export async function main(argv = process.argv.slice(2)) {
   while (inFlight.size > 0) {
     await Promise.race(inFlight);
   }
-  flushWrites();
 
   out.end();
   if (bar) {
