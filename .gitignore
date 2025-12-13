@@ -3,3 +3,5 @@ dist
 dist-test
 .env
 .npm-cache
+*.jsonl
+*.txt
