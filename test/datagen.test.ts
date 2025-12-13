@@ -48,6 +48,18 @@ test("parseArgs parses OpenRouter provider flags", () => {
   assert.equal(args.openrouterProviderSort, "throughput");
 });
 
+test("parseArgs parses --reasoningEffort", () => {
+  const args = parseArgs([
+    "--model",
+    "m",
+    "--prompts",
+    "p.txt",
+    "--reasoningEffort",
+    "high"
+  ]);
+  assert.equal(args.reasoningEffort, "high");
+});
+
 test("buildRequestMessages omits system when empty", () => {
   const msgs = buildRequestMessages("", "hi");
   assert.deepEqual(msgs, [{ role: "user", content: "hi" }]);
@@ -118,6 +130,7 @@ test("callOpenRouter sends correct payload and parses reasoning", async () => {
     { role: "user", content: "user" }
   ]);
   assert.equal(body.provider, undefined);
+  assert.equal(body.reasoning, undefined);
 });
 
 test("callOpenRouter includes provider prefs when provided", async () => {
@@ -155,6 +168,82 @@ test("callOpenRouter includes provider prefs when provided", async () => {
   assert.equal(calls.length, 1);
   const body = JSON.parse(calls[0].init.body);
   assert.deepEqual(body.provider, { order: ["openai"], sort: "throughput" });
+});
+
+test("callOpenRouter includes reasoning.effort when provided", async () => {
+  const calls: any[] = [];
+
+  // @ts-expect-error overriding global fetch for test
+  globalThis.fetch = async (url: string, init: any) => {
+    calls.push({ url, init });
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "hello"
+              }
+            }
+          ]
+        };
+      }
+    } as any;
+  };
+
+  await callOpenRouter(
+    "https://openrouter.ai/api/v1",
+    "KEY",
+    "model-x",
+    "",
+    "user",
+    undefined,
+    "high"
+  );
+
+  assert.equal(calls.length, 1);
+  const body = JSON.parse(calls[0].init.body);
+  assert.deepEqual(body.reasoning, { effort: "high" });
+});
+
+test("callOpenRouter reasoning.effort works for non-OpenRouter apiBase", async () => {
+  const calls: any[] = [];
+
+  // @ts-expect-error overriding global fetch for test
+  globalThis.fetch = async (url: string, init: any) => {
+    calls.push({ url, init });
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "hello"
+              }
+            }
+          ]
+        };
+      }
+    } as any;
+  };
+
+  await callOpenRouter(
+    "https://example.com/api/v1",
+    "KEY",
+    "model-x",
+    "",
+    "user",
+    undefined,
+    "minimal"
+  );
+
+  assert.equal(calls.length, 1);
+  const body = JSON.parse(calls[0].init.body);
+  assert.deepEqual(body.reasoning, { effort: "minimal" });
 });
 
 test("ensureReadableFile throws if missing or not a file", async () => {

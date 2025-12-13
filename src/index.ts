@@ -72,6 +72,7 @@ export type Args = {
   concurrent: number;
   openrouterProviderOrder: string[] | null;
   openrouterProviderSort: string | null;
+  reasoningEffort: string | null;
 };
 
 export function parseArgs(argv: string[]): Args {
@@ -130,9 +131,15 @@ export function parseArgs(argv: string[]): Args {
       ? openrouterProviderSortRaw.trim()
       : null;
 
+  const reasoningEffortRaw = args.reasoningEffort;
+  const reasoningEffort =
+    typeof reasoningEffortRaw === "string" && reasoningEffortRaw.trim().length > 0
+      ? reasoningEffortRaw.trim()
+      : null;
+
   if (!model || !promptsPath) {
     throw new Error(
-      "Usage: datagen --model <modelname> --prompts <file.txt> [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system \"...\"] [--store-system true|false] [--concurrent 1] [--openrouter.provider openai,anthropic] [--openrouter.providerSort price|throughput|latency] [--no-progress]"
+      "Usage: datagen --model <modelname> --prompts <file.txt> [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system \"...\"] [--store-system true|false] [--concurrent 1] [--openrouter.provider openai,anthropic] [--openrouter.providerSort price|throughput|latency] [--reasoningEffort low|medium|high] [--no-progress]"
     );
   }
 
@@ -146,7 +153,8 @@ export function parseArgs(argv: string[]): Args {
     progress,
     concurrent,
     openrouterProviderOrder,
-    openrouterProviderSort
+    openrouterProviderSort,
+    reasoningEffort
   };
 }
 
@@ -194,7 +202,8 @@ export async function callOpenRouter(
   model: string,
   systemPrompt: string,
   userPrompt: string,
-  provider?: { order?: string[]; sort?: string }
+  provider?: { order?: string[]; sort?: string },
+  reasoningEffort?: string | null
 ): Promise<{ content: string; reasoning?: string; usage?: OpenRouterUsage }> {
   const url = `${apiBase.replace(/\/$/, "")}/chat/completions`;
   const messages = buildRequestMessages(systemPrompt, userPrompt);
@@ -203,6 +212,12 @@ export async function callOpenRouter(
     provider && (Array.isArray(provider.order) || typeof provider.sort === "string")
       ? provider
       : undefined;
+  const reasoningEffortPref =
+    typeof reasoningEffort === "string" && reasoningEffort.trim().length > 0
+      ? reasoningEffort.trim()
+      : undefined;
+  const reasoningPref =
+    reasoningEffortPref ? { effort: reasoningEffortPref } : undefined;
 
   const res = await fetch(url, {
     method: "POST",
@@ -214,6 +229,7 @@ export async function callOpenRouter(
     body: JSON.stringify({
       model,
       messages,
+      ...(reasoningPref ? { reasoning: reasoningPref } : {}),
       ...(providerPref ? { provider: providerPref } : {})
     })
   });
@@ -279,7 +295,8 @@ export async function main(argv = process.argv.slice(2)) {
     progress,
     concurrent,
     openrouterProviderOrder,
-    openrouterProviderSort
+    openrouterProviderSort,
+    reasoningEffort
   } = parsed;
 
   const apiKey = process.env.API_KEY;
@@ -345,6 +362,7 @@ export async function main(argv = process.argv.slice(2)) {
       providerPref
         ? `OpenRouter provider prefs: ${JSON.stringify(providerPref)}`
         : null,
+      reasoningEffort ? `Reasoning effort: ${reasoningEffort}` : null,
       `Pricing (USD per 1M tokens): prompt=${formatUsdPerMillionTokens(pricing.known.prompt, pricing.raw.prompt, pricing.promptPerTokenUSD)} completion=${formatUsdPerMillionTokens(pricing.known.completion, pricing.raw.completion, pricing.completionPerTokenUSD)}`,
       `Pricing (USD per token): prompt=${formatUsdOrUnknown(pricing.known.prompt, pricing.raw.prompt, pricing.promptPerTokenUSD)}/token completion=${formatUsdOrUnknown(pricing.known.completion, pricing.raw.completion, pricing.completionPerTokenUSD)}/token`,
       `Pricing (USD per request): request=${formatUsdOrUnknown(pricing.known.request, pricing.raw.request, pricing.requestUSD)}/request`
@@ -426,7 +444,8 @@ export async function main(argv = process.argv.slice(2)) {
           model,
           systemPrompt,
           prompt,
-          providerPref
+          providerPref,
+          reasoningEffort
         );
 
         if (canTrackSpend && pricing) {
