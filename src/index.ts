@@ -404,6 +404,20 @@ export async function main(argv = process.argv.slice(2)) {
   const inFlight = new Set<Promise<void>>();
   const maxConcurrent = Math.max(1, concurrent);
 
+  let writeQueue = Promise.resolve();
+  const writeJsonlLine = (line: string) => {
+    writeQueue = writeQueue.then(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          out.write(line, (err) => {
+            if (err) reject(err);
+            else resolve();
+          });
+        })
+    );
+    return writeQueue;
+  };
+
   const renderProgress = () => {
     if (!bar) return;
     bar.render(completed, {
@@ -438,7 +452,7 @@ export async function main(argv = process.argv.slice(2)) {
           storeSystem
         );
 
-        out.write(JSON.stringify({ messages }) + "\n");
+        await writeJsonlLine(JSON.stringify({ messages }) + "\n");
         okCount++;
       } catch (err: any) {
         const msg = `ERR line ${line}: ${err?.message ?? String(err)}`;
