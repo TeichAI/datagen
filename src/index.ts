@@ -69,6 +69,7 @@ export type Args = {
   systemPrompt: string;
   storeSystem: boolean;
   progress: boolean;
+  concurrent: number;
 };
 
 export function parseArgs(argv: string[]): Args {
@@ -103,9 +104,17 @@ export function parseArgs(argv: string[]): Args {
       : String(progressRaw).toLowerCase() !== "false";
   if (args["no-progress"] !== undefined) progress = false;
 
+  const concurrentRaw = args.concurrent;
+  const concurrentParsed =
+    concurrentRaw === undefined ? 1 : Math.floor(Number(concurrentRaw));
+  const concurrent =
+    Number.isFinite(concurrentParsed) && concurrentParsed > 0
+      ? concurrentParsed
+      : 1;
+
   if (!model || !promptsPath) {
     throw new Error(
-      "Usage: datagen --model <modelname> --prompts <file.txt> [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system \"...\"] [--store-system true|false] [--no-progress]"
+      "Usage: datagen --model <modelname> --prompts <file.txt> [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system \"...\"] [--store-system true|false] [--concurrent 1] [--no-progress]"
     );
   }
 
@@ -116,7 +125,8 @@ export function parseArgs(argv: string[]): Args {
     apiBase,
     systemPrompt,
     storeSystem,
-    progress
+    progress,
+    concurrent
   };
 }
 
@@ -239,7 +249,8 @@ export async function main(argv = process.argv.slice(2)) {
     apiBase,
     systemPrompt,
     storeSystem,
-    progress
+    progress,
+    concurrent
   } = parsed;
 
   const apiKey = process.env.API_KEY;
@@ -319,63 +330,119 @@ export async function main(argv = process.argv.slice(2)) {
   const out = createWriteStream(absOutPath, { flags: "w" });
 
   let lineNum = 0;
-  let processed = 0;
+  let completed = 0;
   let okCount = 0;
   let errCount = 0;
   let spentUsd = 0;
   const canTrackSpend = Boolean(
     pricing && pricing.known.prompt && pricing.known.completion && pricing.known.request
   );
-  if (bar) bar.render(0, { ok: 0, err: 0, spentUsd: canTrackSpend ? spentUsd : undefined });
+  if (bar)
+    bar.render(0, {
+      ok: 0,
+      err: 0,
+      spentUsd: canTrackSpend ? spentUsd : undefined
+    });
 
+  const results = new Map<
+    number,
+    { lineNum: number; record?: any; errorMsg?: string }
+  >();
+  let nextToWrite = 0;
+
+  const inFlight = new Set<Promise<void>>();
+  const maxConcurrent = Math.max(1, concurrent);
+
+  const renderProgress = () => {
+    if (!bar) return;
+    bar.render(completed, {
+      ok: okCount,
+      err: errCount,
+      spentUsd: canTrackSpend ? spentUsd : undefined
+    });
+  };
+
+  const flushWrites = () => {
+    while (results.has(nextToWrite)) {
+      const r = results.get(nextToWrite)!;
+      results.delete(nextToWrite);
+
+      if (r.record) {
+        out.write(JSON.stringify(r.record) + "\n");
+      } else if (r.errorMsg) {
+        if (bar) bar.writeLine(r.errorMsg);
+        else process.stderr.write(r.errorMsg + "\n");
+      }
+
+      nextToWrite++;
+    }
+  };
+
+  const schedule = (index: number, line: number, prompt: string) => {
+    const p = (async () => {
+      try {
+        const { content, reasoning, usage } = await callOpenRouter(
+          apiBase,
+          apiKey,
+          model,
+          systemPrompt,
+          prompt
+        );
+
+        if (canTrackSpend && pricing) {
+          spentUsd += calculateOpenRouterSpendUSD(pricing, usage);
+        }
+
+        const assistantContent = formatAssistantContent(content, reasoning);
+        const messages = buildOutputMessages(
+          systemPrompt,
+          prompt,
+          assistantContent,
+          storeSystem
+        );
+
+        results.set(index, { lineNum: line, record: { messages } });
+        okCount++;
+      } catch (err: any) {
+        const msg = `ERR line ${line}: ${err?.message ?? String(err)}`;
+        results.set(index, { lineNum: line, errorMsg: msg });
+        errCount++;
+      } finally {
+        completed++;
+        flushWrites();
+        renderProgress();
+      }
+    })();
+
+    inFlight.add(p);
+    p.finally(() => inFlight.delete(p));
+  };
+
+  const waitForSlot = async () => {
+    while (inFlight.size >= maxConcurrent) {
+      await Promise.race(inFlight);
+    }
+  };
+
+  let promptIndex = 0;
   for await (const line of rl) {
     lineNum++;
     const prompt = line.trim();
     if (!prompt) continue;
 
-    try {
-      const { content, reasoning, usage } = await callOpenRouter(
-        apiBase,
-        apiKey,
-        model,
-        systemPrompt,
-        prompt
-      );
-      if (canTrackSpend && pricing) spentUsd += calculateOpenRouterSpendUSD(pricing, usage);
-
-      const assistantContent = formatAssistantContent(content, reasoning);
-      const messages = buildOutputMessages(
-        systemPrompt,
-        prompt,
-        assistantContent,
-        storeSystem
-      );
-
-      const record = { messages };
-
-      out.write(JSON.stringify(record) + "\n");
-      okCount++;
-      if (!bar) process.stderr.write(`OK line ${lineNum}\n`);
-    } catch (err: any) {
-      errCount++;
-      const msg = `ERR line ${lineNum}: ${err?.message ?? String(err)}`;
-      if (bar) bar.writeLine(msg);
-      else process.stderr.write(msg + "\n");
-    } finally {
-      processed++;
-      if (bar) {
-        bar.render(processed, {
-          ok: okCount,
-          err: errCount,
-          spentUsd: canTrackSpend ? spentUsd : undefined
-        });
-      }
-    }
+    await waitForSlot();
+    schedule(promptIndex, lineNum, prompt);
+    promptIndex++;
   }
+
+  while (inFlight.size > 0) {
+    await Promise.race(inFlight);
+  }
+  flushWrites();
 
   out.end();
   if (bar) {
-    bar.finish(processed, {
+    bar.finish(completed, {
       ok: okCount,
       err: errCount,
       spentUsd: canTrackSpend ? spentUsd : undefined

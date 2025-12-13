@@ -23,6 +23,16 @@ test("parseArgs defaults store-system to true", () => {
   assert.equal(args.storeSystem, true);
 });
 
+test("parseArgs defaults concurrent to 1", () => {
+  const args = parseArgs(["--model", "m", "--prompts", "p.txt"]);
+  assert.equal(args.concurrent, 1);
+});
+
+test("parseArgs parses --concurrent", () => {
+  const args = parseArgs(["--model", "m", "--prompts", "p.txt", "--concurrent", "3"]);
+  assert.equal(args.concurrent, 3);
+});
+
 test("buildRequestMessages omits system when empty", () => {
   const msgs = buildRequestMessages("", "hi");
   assert.deepEqual(msgs, [{ role: "user", content: "hi" }]);

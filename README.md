@@ -50,4 +50,5 @@ API_KEY="your_openrouter_key" npm run dev -- --model openai/gpt-4o-mini --prompt
 - `--api <baseUrl>`: API base (default OpenRouter).
 - `--system <text>`: optional system prompt.
 - `--store-system true|false`: store system message in output (default `true`).
+- `--concurrent <num>`: number of in-flight requests (default `1`).
 - `--no-progress`: disable the progress bar.
