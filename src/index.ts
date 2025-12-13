@@ -70,6 +70,8 @@ export type Args = {
   storeSystem: boolean;
   progress: boolean;
   concurrent: number;
+  openrouterProviderOrder: string[] | null;
+  openrouterProviderSort: string | null;
 };
 
 export function parseArgs(argv: string[]): Args {
@@ -112,9 +114,25 @@ export function parseArgs(argv: string[]): Args {
       ? concurrentParsed
       : 1;
 
+  const openrouterProviderRaw = args["openrouter.provider"];
+  const openrouterProviderOrder =
+    typeof openrouterProviderRaw === "string" && openrouterProviderRaw.trim().length > 0
+      ? openrouterProviderRaw
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0)
+      : null;
+
+  const openrouterProviderSortRaw = args["openrouter.providerSort"];
+  const openrouterProviderSort =
+    typeof openrouterProviderSortRaw === "string" &&
+    openrouterProviderSortRaw.trim().length > 0
+      ? openrouterProviderSortRaw.trim()
+      : null;
+
   if (!model || !promptsPath) {
     throw new Error(
-      "Usage: datagen --model <modelname> --prompts <file.txt> [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system \"...\"] [--store-system true|false] [--concurrent 1] [--no-progress]"
+      "Usage: datagen --model <modelname> --prompts <file.txt> [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system \"...\"] [--store-system true|false] [--concurrent 1] [--openrouter.provider openai,anthropic] [--openrouter.providerSort price|throughput|latency] [--no-progress]"
     );
   }
 
@@ -126,7 +144,9 @@ export function parseArgs(argv: string[]): Args {
     systemPrompt,
     storeSystem,
     progress,
-    concurrent
+    concurrent,
+    openrouterProviderOrder,
+    openrouterProviderSort
   };
 }
 
@@ -173,10 +193,16 @@ export async function callOpenRouter(
   apiKey: string,
   model: string,
   systemPrompt: string,
-  userPrompt: string
+  userPrompt: string,
+  provider?: { order?: string[]; sort?: string }
 ): Promise<{ content: string; reasoning?: string; usage?: OpenRouterUsage }> {
   const url = `${apiBase.replace(/\/$/, "")}/chat/completions`;
   const messages = buildRequestMessages(systemPrompt, userPrompt);
+
+  const providerPref =
+    provider && (Array.isArray(provider.order) || typeof provider.sort === "string")
+      ? provider
+      : undefined;
 
   const res = await fetch(url, {
     method: "POST",
@@ -187,7 +213,8 @@ export async function callOpenRouter(
     },
     body: JSON.stringify({
       model,
-      messages
+      messages,
+      ...(providerPref ? { provider: providerPref } : {})
     })
   });
 
@@ -250,7 +277,9 @@ export async function main(argv = process.argv.slice(2)) {
     systemPrompt,
     storeSystem,
     progress,
-    concurrent
+    concurrent,
+    openrouterProviderOrder,
+    openrouterProviderSort
   } = parsed;
 
   const apiKey = process.env.API_KEY;
@@ -283,6 +312,13 @@ export async function main(argv = process.argv.slice(2)) {
     useProgress && totalPrompts > 0 ? new ProgressBar(totalPrompts, process.stderr) : null;
 
   const isOpenRouter = isOpenRouterApiBase(apiBase);
+  const providerPref =
+    isOpenRouter && (openrouterProviderOrder || openrouterProviderSort)
+      ? {
+          ...(openrouterProviderOrder ? { order: openrouterProviderOrder } : {}),
+          ...(openrouterProviderSort ? { sort: openrouterProviderSort } : {})
+        }
+      : undefined;
   let pricing: OpenRouterModelPricing | null = null;
   if (isOpenRouter) {
     try {
@@ -306,9 +342,12 @@ export async function main(argv = process.argv.slice(2)) {
       pricing.modelId !== model
         ? `OpenRouter pricing model: ${pricing.modelId}`
         : null,
+      providerPref
+        ? `OpenRouter provider prefs: ${JSON.stringify(providerPref)}`
+        : null,
       `Pricing (USD per 1M tokens): prompt=${formatUsdPerMillionTokens(pricing.known.prompt, pricing.raw.prompt, pricing.promptPerTokenUSD)} completion=${formatUsdPerMillionTokens(pricing.known.completion, pricing.raw.completion, pricing.completionPerTokenUSD)}`,
       `Pricing (USD per token): prompt=${formatUsdOrUnknown(pricing.known.prompt, pricing.raw.prompt, pricing.promptPerTokenUSD)}/token completion=${formatUsdOrUnknown(pricing.known.completion, pricing.raw.completion, pricing.completionPerTokenUSD)}/token`,
-      ` `
+      `Pricing (USD per request): request=${formatUsdOrUnknown(pricing.known.request, pricing.raw.request, pricing.requestUSD)}/request`
     ].filter((l): l is string => Boolean(l));
     for (const l of lines) {
       if (bar) bar.writeLine(l);
@@ -386,7 +425,8 @@ export async function main(argv = process.argv.slice(2)) {
           apiKey,
           model,
           systemPrompt,
-          prompt
+          prompt,
+          providerPref
         );
 
         if (canTrackSpend && pricing) {

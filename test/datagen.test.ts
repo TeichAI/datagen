@@ -33,6 +33,21 @@ test("parseArgs parses --concurrent", () => {
   assert.equal(args.concurrent, 3);
 });
 
+test("parseArgs parses OpenRouter provider flags", () => {
+  const args = parseArgs([
+    "--model",
+    "m",
+    "--prompts",
+    "p.txt",
+    "--openrouter.provider",
+    "openai, anthropic",
+    "--openrouter.providerSort",
+    "throughput"
+  ]);
+  assert.deepEqual(args.openrouterProviderOrder, ["openai", "anthropic"]);
+  assert.equal(args.openrouterProviderSort, "throughput");
+});
+
 test("buildRequestMessages omits system when empty", () => {
   const msgs = buildRequestMessages("", "hi");
   assert.deepEqual(msgs, [{ role: "user", content: "hi" }]);
@@ -87,7 +102,8 @@ test("callOpenRouter sends correct payload and parses reasoning", async () => {
     "KEY",
     "model-x",
     "sys",
-    "user"
+    "user",
+    undefined
   );
 
   assert.equal(res.content, "hello");
@@ -101,6 +117,44 @@ test("callOpenRouter sends correct payload and parses reasoning", async () => {
     { role: "system", content: "sys" },
     { role: "user", content: "user" }
   ]);
+  assert.equal(body.provider, undefined);
+});
+
+test("callOpenRouter includes provider prefs when provided", async () => {
+  const calls: any[] = [];
+
+  // @ts-expect-error overriding global fetch for test
+  globalThis.fetch = async (url: string, init: any) => {
+    calls.push({ url, init });
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "hello"
+              }
+            }
+          ]
+        };
+      }
+    } as any;
+  };
+
+  await callOpenRouter(
+    "https://openrouter.ai/api/v1",
+    "KEY",
+    "model-x",
+    "",
+    "user",
+    { order: ["openai"], sort: "throughput" }
+  );
+
+  assert.equal(calls.length, 1);
+  const body = JSON.parse(calls[0].init.body);
+  assert.deepEqual(body.provider, { order: ["openai"], sort: "throughput" });
 });
 
 test("ensureReadableFile throws if missing or not a file", async () => {
