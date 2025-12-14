@@ -9,6 +9,7 @@ import {
   type OpenRouterModelPricing,
   type OpenRouterUsage
 } from "./openrouter.js";
+import packageJson from "../package.json" with { type: "json" };
 
 function trimTrailingZeros(num: string): string {
   if (!num.includes(".")) return num;
@@ -59,6 +60,52 @@ function formatUsdOrUnknown(
 ): string {
   if (!known) return "unknown";
   return formatUsdRate(raw, fallback);
+}
+
+const CLI_NAME = "datagen";
+const CLI_VERSION = typeof packageJson.version === "string" ? packageJson.version : "0.0.0";
+
+const HELP_TEXT = [
+  `${CLI_NAME} ${CLI_VERSION}`,
+  "",
+  `Usage: ${CLI_NAME} --model <model> --prompts <file> [options]`,
+  "",
+  "Options:",
+  "  --help                          Show this help message and exit.",
+  "  --version                       Print the CLI version and exit.",
+  "  --model <name>                  Model name to use for completions.",
+  "  --prompts <file>                Path to a file where each line is a prompt.",
+  "  --out <file>                    Output JSONL file (default: dataset.jsonl).",
+  "  --api <baseUrl>                 API base URL (default: https://openrouter.ai/api/v1).",
+  "  --system <text>                 Optional system prompt to include.",
+  "  --store-system true|false       Whether to emit the system prompt in the dataset (default: true).",
+  "  --concurrent <num>              Number of parallel requests (default: 1).",
+  "  --openrouter.provider <slugs>   OpenRouter provider slugs (comma-separated list).",
+  "  --openrouter.providerSort <x>   Provider sorting order (price|throughput|latency).",
+  "  --reasoningEffort <level>       Reasoning effort (none|minimal|low|medium|high|xhigh).",
+  "  --no-progress                   Disable the progress bar.",
+  "",
+  'Environment: Set the API_KEY env var to your OpenRouter API key before running.',
+  ""
+].join("\n");
+
+const USAGE_LINE = `Usage: ${CLI_NAME} --model <model> --prompts <file> [options]`;
+
+const FLAG_ALIASES: Record<string, string[]> = {
+  help: ["--help", "-h"],
+  version: ["--version", "-v"]
+};
+
+function hasFlag(argv: string[], flags: string[]) {
+  return argv.some((token) => flags.includes(token));
+}
+
+export function printHelp() {
+  console.log(HELP_TEXT);
+}
+
+export function printVersion() {
+  console.log(`${CLI_NAME} ${CLI_VERSION}`);
 }
 
 export type Args = {
@@ -139,7 +186,7 @@ export function parseArgs(argv: string[]): Args {
 
   if (!model || !promptsPath) {
     throw new Error(
-      "Usage: datagen --model <modelname> --prompts <file.txt> [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system \"...\"] [--store-system true|false] [--concurrent 1] [--openrouter.provider openai,anthropic] [--openrouter.providerSort price|throughput|latency] [--reasoningEffort low|medium|high] [--no-progress]"
+      `${USAGE_LINE} [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system "..."] [--store-system true|false] [--concurrent 1] [--openrouter.provider openai,anthropic] [--openrouter.providerSort price|throughput|latency] [--reasoningEffort low|medium|high] [--no-progress]`
     );
   }
 
@@ -276,6 +323,16 @@ export async function ensureReadableFile(filePath: string) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
+  if (hasFlag(argv, FLAG_ALIASES.help)) {
+    printHelp();
+    return;
+  }
+
+  if (hasFlag(argv, FLAG_ALIASES.version)) {
+    printVersion();
+    return;
+  }
+
   let parsed: Args;
   try {
     parsed = parseArgs(argv);
