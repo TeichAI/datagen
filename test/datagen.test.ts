@@ -60,6 +60,54 @@ test("parseArgs parses --reasoningEffort", () => {
   assert.equal(args.reasoningEffort, "high");
 });
 
+test("parseArgs supports --config YAML", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "datagen-"));
+  const configPath = join(dir, "config.yaml");
+  await writeFile(
+    configPath,
+    [
+      "model: m",
+      "prompts: p.txt",
+      "out: o.jsonl",
+      "api: https://openrouter.ai/api/v1",
+      "system: |",
+      "  line1",
+      "  line2",
+      "store-system: false",
+      "concurrent: 3",
+      "openrouter:",
+      "  provider:",
+      "    - openai",
+      "    - anthropic",
+      "  providerSort: throughput",
+      "reasoningEffort: high",
+      "no-progress: true",
+      ""
+    ].join("\n")
+  );
+  const args = parseArgs(["--config", configPath]);
+  assert.equal(args.model, "m");
+  assert.equal(args.promptsPath, "p.txt");
+  assert.equal(args.outPath, "o.jsonl");
+  assert.equal(args.apiBase, "https://openrouter.ai/api/v1");
+  assert.equal(args.systemPrompt, "line1\nline2");
+  assert.equal(args.storeSystem, false);
+  assert.equal(args.concurrent, 3);
+  assert.deepEqual(args.openrouterProviderOrder, ["openai", "anthropic"]);
+  assert.equal(args.openrouterProviderSort, "throughput");
+  assert.equal(args.reasoningEffort, "high");
+  assert.equal(args.progress, false);
+});
+
+test("parseArgs lets CLI override config", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "datagen-"));
+  const configPath = join(dir, "config.yaml");
+  await writeFile(configPath, ["model: a", "prompts: p.txt", ""].join("\n"));
+  const args = parseArgs(["--config", configPath, "--model", "b"]);
+  assert.equal(args.model, "b");
+  assert.equal(args.promptsPath, "p.txt");
+});
+
 test("buildRequestMessages omits system when empty", () => {
   const msgs = buildRequestMessages("", "hi");
   assert.deepEqual(msgs, [{ role: "user", content: "hi" }]);

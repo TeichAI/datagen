@@ -5,3 +5,4 @@ dist-test
 .npm-cache
 *.jsonl
 *.txt
+config.yaml
