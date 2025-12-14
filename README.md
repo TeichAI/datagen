@@ -44,6 +44,8 @@ API_KEY="your_openrouter_key" npm run dev -- --model openai/gpt-4o-mini --prompt
 
 ### Options
 
+- `--help`: show the help message and exit.
+- `--version`: print the CLI version and exit.
 - `--model <name>`: required model name.
 - `--prompts <file>`: required prompts file.
 - `--out <file>`: output JSONL (default `dataset.jsonl`).
