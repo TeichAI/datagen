@@ -10,6 +10,7 @@ import {
   type OpenRouterUsage
 } from "./openrouter.js";
 import packageJson from "../package.json" with { type: "json" };
+import { maybeNotifyNewVersion } from "./update-check.js";
 
 function trimTrailingZeros(num: string): string {
   if (!num.includes(".")) return num;
@@ -63,6 +64,7 @@ function formatUsdOrUnknown(
 }
 
 const CLI_NAME = "datagen";
+const CLI_PACKAGE_NAME = typeof packageJson.name === "string" ? packageJson.name : CLI_NAME;
 const CLI_VERSION = typeof packageJson.version === "string" ? packageJson.version : "0.0.0";
 
 const HELP_TEXT = [
@@ -323,6 +325,12 @@ export async function ensureReadableFile(filePath: string) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
+  await maybeNotifyNewVersion({
+    cliName: CLI_NAME,
+    packageName: CLI_PACKAGE_NAME,
+    currentVersion: CLI_VERSION
+  });
+
   if (hasFlag(argv, FLAG_ALIASES.help)) {
     printHelp();
     return;

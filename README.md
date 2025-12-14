@@ -5,7 +5,14 @@ A easy to use CLI to generate JSONL datasets from a TXT file using LLMs.
 ## Install
 
 ```bash
-npm i @teichai/datagen
+npm i -g @teichai/datagen
+```
+
+Or install locally and run via `npx`:
+
+```bash
+npm i -D @teichai/datagen
+npx datagen --help
 ```
 
 Run tests:
@@ -34,6 +41,8 @@ Run:
 ```bash
 datagen --model openai/gpt-4o-mini --prompts prompts.txt
 ```
+
+Note: On startup, `datagen` does a quick best-effort check for a newer npm version and prints an upgrade command if available. Disable with `DATAGEN_DISABLE_UPDATE_CHECK=1`.
 
 Development (build + run once):
 
