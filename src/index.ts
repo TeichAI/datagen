@@ -2,6 +2,7 @@ import { createReadStream, createWriteStream, promises as fs } from "node:fs";
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import { countNonEmptyLines, ProgressBar } from "./progress.js";
+import { loadConfigRawArgs } from "./config.js";
 import {
   calculateOpenRouterSpendUSD,
   getOpenRouterModelPricing,
@@ -75,6 +76,7 @@ const HELP_TEXT = [
   "Options:",
   "  --help                          Show this help message and exit.",
   "  --version                       Print the CLI version and exit.",
+  "  --config <file>                 Load options from a YAML/JSON config file.",
   "  --model <name>                  Model name to use for completions.",
   "  --prompts <file>                Path to a file where each line is a prompt.",
   "  --out <file>                    Output JSONL file (default: dataset.jsonl).",
@@ -124,11 +126,18 @@ export type Args = {
   reasoningEffort: string | null;
 };
 
-export function parseArgs(argv: string[]): Args {
+function parseRawArgs(argv: string[]): Record<string, string | boolean> {
   const args: Record<string, string | boolean> = {};
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
     if (!token.startsWith("--")) continue;
+    const eqIdx = token.indexOf("=");
+    if (eqIdx !== -1) {
+      const key = token.slice(2, eqIdx);
+      const value = token.slice(eqIdx + 1);
+      if (key.length > 0) args[key] = value;
+      continue;
+    }
     const key = token.slice(2);
     const next = argv[i + 1];
     if (!next || next.startsWith("--")) {
@@ -138,7 +147,10 @@ export function parseArgs(argv: string[]): Args {
       i++;
     }
   }
+  return args;
+}
 
+function parseArgsFromRaw(args: Record<string, string | boolean>): Args {
   const model = (args.model as string) || "";
   const promptsPath = (args.prompts as string) || "";
   const outPath = (args.out as string) || "dataset.jsonl";
@@ -205,6 +217,25 @@ export function parseArgs(argv: string[]): Args {
     openrouterProviderSort,
     reasoningEffort
   };
+}
+
+export function parseArgs(argv: string[]): Args {
+  const cliRaw = parseRawArgs(argv);
+  const configRawValue = cliRaw.config;
+  if (configRawValue !== undefined && typeof configRawValue !== "string") {
+    throw new Error(`${USAGE_LINE} --config <file>`);
+  }
+  const configPath =
+    typeof configRawValue === "string" && configRawValue.trim().length > 0
+      ? resolve(configRawValue)
+      : null;
+
+  const merged =
+    configPath
+      ? { ...loadConfigRawArgs(configPath), ...cliRaw }
+      : cliRaw;
+
+  return parseArgsFromRaw(merged);
 }
 
 export function buildRequestMessages(
