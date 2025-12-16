@@ -69,19 +69,21 @@ async function writeCache(cacheFilePath: string, cache: UpdateCache): Promise<vo
   await fs.writeFile(cacheFilePath, JSON.stringify(cache), "utf8");
 }
 
-async function fetchLatestFromNpm(packageName: string, timeoutMs: number): Promise<string | null> {
+async function fetchLatestFromRepo(timeoutMs: number): Promise<string | null> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
-    const res = await fetch(`https://registry.npmjs.org/${encodeURIComponent(packageName)}`, {
+    const res = await fetch(
+      "https://raw.githubusercontent.com/TeichAI/datagen/refs/heads/main/package.json",
+      {
       signal: ac.signal,
       headers: {
-        accept: "application/vnd.npm.install-v1+json"
+          accept: "application/json"
       }
     });
     if (!res.ok) return null;
     const data = (await res.json()) as any;
-    const latest = data?.["dist-tags"]?.latest;
+    const latest = data?.version;
     return typeof latest === "string" ? latest : null;
   } catch {
     return null;
@@ -111,7 +113,7 @@ export async function maybeNotifyNewVersion(opts: {
   if (cached && now - cached.checkedAt <= cacheMaxAgeMs) {
     latest = cached.latest;
   } else {
-    latest = await fetchLatestFromNpm(opts.packageName, timeoutMs);
+    latest = await fetchLatestFromRepo(timeoutMs);
     try {
       await writeCache(cacheFilePath, { checkedAt: now, latest });
     } catch {
