@@ -87,6 +87,7 @@ const HELP_TEXT = [
   "  --openrouter.provider <slugs>   OpenRouter provider slugs (comma-separated list).",
   "  --openrouter.providerSort <x>   Provider sorting order (price|throughput|latency).",
   "  --reasoningEffort <level>       Reasoning effort (none|minimal|low|medium|high|xhigh).",
+  "  --timeout <ms>                  Request timeout in milliseconds.",
   "  --no-progress                   Disable the progress bar.",
   "",
   'Environment: Set the API_KEY env var to your OpenRouter API key before running.',
@@ -124,6 +125,7 @@ export type Args = {
   openrouterProviderOrder: string[] | null;
   openrouterProviderSort: string | null;
   reasoningEffort: string | null;
+  timeout: number | null;
 };
 
 function parseRawArgs(argv: string[]): Record<string, string | boolean> {
@@ -198,9 +200,17 @@ function parseArgsFromRaw(args: Record<string, string | boolean>): Args {
       ? reasoningEffortRaw.trim()
       : null;
 
+  const timeoutRaw = args.timeout;
+  const timeoutParsed =
+    timeoutRaw === undefined ? null : Math.floor(Number(timeoutRaw));
+  const timeout =
+    timeoutParsed !== null && Number.isFinite(timeoutParsed) && timeoutParsed > 0
+      ? timeoutParsed
+      : null;
+
   if (!model || !promptsPath) {
     throw new Error(
-      `${USAGE_LINE} [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system "..."] [--store-system true|false] [--concurrent 1] [--openrouter.provider openai,anthropic] [--openrouter.providerSort price|throughput|latency] [--reasoningEffort low|medium|high] [--no-progress]`
+      `${USAGE_LINE} [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system "..."] [--store-system true|false] [--concurrent 1] [--openrouter.provider openai,anthropic] [--openrouter.providerSort price|throughput|latency] [--reasoningEffort low|medium|high] [--timeout <ms>] [--no-progress]`
     );
   }
 
@@ -215,7 +225,8 @@ function parseArgsFromRaw(args: Record<string, string | boolean>): Args {
     concurrent,
     openrouterProviderOrder,
     openrouterProviderSort,
-    reasoningEffort
+    reasoningEffort,
+    timeout
   };
 }
 
@@ -283,7 +294,8 @@ export async function callOpenRouter(
   systemPrompt: string,
   userPrompt: string,
   provider?: { order?: string[]; sort?: string },
-  reasoningEffort?: string | null
+  reasoningEffort?: string | null,
+  timeout?: number | null
 ): Promise<{ content: string; reasoning?: string; usage?: OpenRouterUsage }> {
   const url = `${apiBase.replace(/\/$/, "")}/chat/completions`;
   const messages = buildRequestMessages(systemPrompt, userPrompt);
@@ -299,42 +311,58 @@ export async function callOpenRouter(
   const reasoningPref =
     reasoningEffortPref ? { effort: reasoningEffortPref } : undefined;
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-      // IMPORTANT: no OpenRouter application headers (HTTP-Referer / X-Title)
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      ...(reasoningPref ? { reasoning: reasoningPref } : {}),
-      ...(providerPref ? { provider: providerPref } : {})
-    })
-  });
+  const controller = typeof timeout === "number" && timeout > 0 ? new AbortController() : undefined;
+  const timeoutId =
+    controller && typeof timeout === "number" && timeout > 0
+      ? setTimeout(() => controller.abort(), timeout)
+      : undefined;
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`OpenRouter error ${res.status}: ${text}`);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        ...(reasoningPref ? { reasoning: reasoningPref } : {}),
+        ...(providerPref ? { provider: providerPref } : {})
+      }),
+      signal: controller?.signal
+    });
+
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`OpenRouter error ${res.status}: ${text}`);
+    }
+
+    const data = (await res.json()) as any;
+    const choice = data?.choices?.[0];
+    const message = choice?.message ?? choice?.delta ?? {};
+    const content = message?.content ?? "";
+    const reasoning =
+      message?.reasoning ??
+      choice?.reasoning ??
+      data?.reasoning ??
+      undefined;
+    const usage = data?.usage as OpenRouterUsage | undefined;
+
+    if (typeof content !== "string" || !content.length) {
+      throw new Error("No assistant content returned from OpenRouter.");
+    }
+
+    return { content, reasoning, usage };
+  } catch (err: any) {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+    if (err?.name === "AbortError") {
+      throw new Error(`Request timeout after ${timeout}ms`);
+    }
+    throw err;
   }
-
-  const data = (await res.json()) as any;
-  const choice = data?.choices?.[0];
-  const message = choice?.message ?? choice?.delta ?? {};
-  const content = message?.content ?? "";
-  const reasoning =
-    message?.reasoning ??
-    choice?.reasoning ??
-    data?.reasoning ??
-    undefined;
-  const usage = data?.usage as OpenRouterUsage | undefined;
-
-  if (typeof content !== "string" || !content.length) {
-    throw new Error("No assistant content returned from OpenRouter.");
-  }
-
-  return { content, reasoning, usage };
 }
 
 export async function ensureReadableFile(filePath: string) {
@@ -392,7 +420,8 @@ export async function main(argv = process.argv.slice(2)) {
     concurrent,
     openrouterProviderOrder,
     openrouterProviderSort,
-    reasoningEffort
+    reasoningEffort,
+    timeout
   } = parsed;
 
   const apiKey = process.env.API_KEY;
@@ -533,7 +562,8 @@ export async function main(argv = process.argv.slice(2)) {
           systemPrompt,
           prompt,
           providerPref,
-          reasoningEffort
+          reasoningEffort,
+          timeout
         );
 
         if (canTrackSpend && pricing) {

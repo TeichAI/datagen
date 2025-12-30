@@ -36,6 +36,7 @@ openrouter:
     - openai
     - anthropic
   providerSort: throughput
+timeout: 60000
 no-progress: true
 ```
 

@@ -38,6 +38,7 @@ Required:
 - `--openrouter.provider <slugs>` OpenRouter provider slugs (comma-separated list).
 - `--openrouter.providerSort <x>` Provider sorting order (`price|throughput|latency`).
 - `--reasoningEffort <level>` Reasoning effort (`none|minimal|low|medium|high|xhigh`).
+- `--timeout <ms>` Request timeout in milliseconds.
 - `--no-progress` Disable the progress bar.
 
 ## Environment
