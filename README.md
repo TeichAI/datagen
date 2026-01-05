@@ -42,6 +42,25 @@ Run:
 datagen --model openai/gpt-4o-mini --prompts prompts.txt
 ```
 
+### Configuration File
+
+You can also use a YAML config file:
+
+```yaml
+model: openai/gpt-4o-mini
+prompts: ./prompts.txt
+out: ./dataset.jsonl
+concurrent: 5
+openrouter:
+  providerSort: throughput
+```
+
+Run with:
+
+```bash
+datagen --config config.yaml
+```
+
 Note: On startup, `datagen` does a quick best-effort check for a newer npm version and prints an upgrade command if available. Disable with `DATAGEN_DISABLE_UPDATE_CHECK=1`.
 
 Development (build + run once):
