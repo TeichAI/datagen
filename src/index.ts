@@ -506,17 +506,34 @@ export async function main(argv = process.argv.slice(2)) {
       return;
     }
   }
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const deleteKeyWithRetry = async (hash: string) => {
+    const delays = [250, 500, 1000, 2000];
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      try {
+        await deleteOpenRouterApiKey(apiBase, apiKey, hash);
+        return;
+      } catch (err) {
+        lastError = err;
+        if (attempt < delays.length) {
+          await sleep(delays[attempt]);
+        }
+      }
+    }
+    const msg = `WARN: Failed to delete key ${hash}: ${
+      (lastError as any)?.message ?? String(lastError)
+    }`;
+    writeLine(msg);
+  };
   let cleanupStarted = false;
   const cleanupKeys = async () => {
-    if (!useFreeKeys || spawnedKeyHashes.length === 0) return;
-    await Promise.all(
-      spawnedKeyHashes.map((hash) =>
-        deleteOpenRouterApiKey(apiBase, apiKey, hash).catch((err: any) => {
-          const msg = `WARN: Failed to delete key ${hash}: ${err?.message ?? String(err)}`;
-          writeLine(msg);
-        })
-      )
-    );
+    if (!useFreeKeys) return;
+    const hashes = new Set(spawnedKeyHashes);
+    if (hashes.size === 0) return;
+    for (const hash of hashes) {
+      await deleteKeyWithRetry(hash);
+    }
   };
   const handleTermination = () => {
     if (cleanupStarted) return;
