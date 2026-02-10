@@ -6,6 +6,7 @@ import { loadConfigRawArgs } from "./config.js";
 import {
   calculateOpenRouterSpendUSD,
   createOpenRouterApiKey,
+  deleteOpenRouterApiKey,
   getOpenRouterModelPricing,
   isOpenRouterApiBase,
   type OpenRouterModelPricing,
@@ -468,6 +469,10 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const bar =
     useProgress && totalPrompts > 0 ? new ProgressBar(totalPrompts, process.stderr) : null;
+  const writeLine = (msg: string) => {
+    if (bar) bar.writeLine(msg);
+    else process.stderr.write(msg + "\n");
+  };
 
   const isOpenRouter = isOpenRouterApiBase(apiBase);
   const useFreeKeys = isOpenRouter && openrouterIsFree;
@@ -475,18 +480,22 @@ export async function main(argv = process.argv.slice(2)) {
   if (useFreeKeys) {
     const msg =
       "INFO: openrouter.isFree is enabled. API_KEY must be an OpenRouter management key to create per-request keys.";
-    if (bar) bar.writeLine(msg);
-    else process.stderr.write(msg + "\n");
+    writeLine(msg);
   }
   let requestKeys = [apiKey];
+  let spawnedKeyHashes: string[] = [];
   if (useFreeKeys) {
     const baseName = `datagen-${Date.now()}`;
     try {
-      requestKeys = await Promise.all(
+      const createdKeys = await Promise.all(
         Array.from({ length: maxConcurrent }, (_, idx) =>
           createOpenRouterApiKey(apiBase, apiKey, `${baseName}-${idx + 1}`)
         )
       );
+      requestKeys = createdKeys.map((item) => item.key);
+      spawnedKeyHashes = createdKeys
+        .map((item) => item.hash)
+        .filter((hash): hash is string => typeof hash === "string");
     } catch (err: any) {
       const details = err?.message ?? String(err);
       console.error(
@@ -497,6 +506,29 @@ export async function main(argv = process.argv.slice(2)) {
       return;
     }
   }
+  let cleanupStarted = false;
+  const cleanupKeys = async () => {
+    if (!useFreeKeys || spawnedKeyHashes.length === 0) return;
+    await Promise.all(
+      spawnedKeyHashes.map((hash) =>
+        deleteOpenRouterApiKey(apiBase, apiKey, hash).catch((err: any) => {
+          const msg = `WARN: Failed to delete key ${hash}: ${err?.message ?? String(err)}`;
+          writeLine(msg);
+        })
+      )
+    );
+  };
+  const handleTermination = () => {
+    if (cleanupStarted) return;
+    cleanupStarted = true;
+    writeLine("Cleaning up processes and exiting.");
+    void cleanupKeys().finally(() => {
+      process.exit(1);
+    });
+  };
+  process.once("SIGINT", handleTermination);
+  process.once("SIGTERM", handleTermination);
+  process.once("SIGQUIT", handleTermination);
   const pricingKey = requestKeys[0];
   const providerPref =
     isOpenRouter && (openrouterProviderOrder || openrouterProviderSort)
@@ -681,6 +713,7 @@ export async function main(argv = process.argv.slice(2)) {
     await Promise.race(inFlight);
   }
 
+  await cleanupKeys();
   out.end();
   if (bar) {
     bar.finish(completed, {

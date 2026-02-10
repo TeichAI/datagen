@@ -58,7 +58,7 @@ export async function createOpenRouterApiKey(
   apiBase: string,
   managementKey: string,
   name: string
-): Promise<string> {
+): Promise<{ key: string; hash: string | null }> {
   const url = `${apiBase.replace(/\/$/, "")}/keys`;
   const res = await fetch(url, {
     method: "POST",
@@ -76,10 +76,31 @@ export async function createOpenRouterApiKey(
 
   const data = (await res.json()) as any;
   const key = data?.data?.key ?? data?.key ?? data?.value?.key ?? data?.data?.value?.key;
+  const hash = data?.data?.hash ?? data?.hash ?? data?.value?.hash ?? data?.data?.value?.hash ?? null;
   if (typeof key !== "string" || key.trim().length === 0) {
     throw new Error("OpenRouter key create response missing key.");
   }
-  return key;
+  return { key, hash: typeof hash === "string" && hash.trim().length > 0 ? hash : null };
+}
+
+export async function deleteOpenRouterApiKey(
+  apiBase: string,
+  managementKey: string,
+  hash: string
+): Promise<void> {
+  const url = `${apiBase.replace(/\/$/, "")}/keys/${encodeURIComponent(hash)}`;
+  const res = await fetch(url, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${managementKey}`,
+      "Content-Type": "application/json"
+    }
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`OpenRouter key delete error ${res.status}: ${text}`);
+  }
 }
 
 const modelsCache = new Map<string, Promise<OpenRouterModel[]>>();
