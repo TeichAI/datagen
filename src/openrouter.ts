@@ -54,6 +54,34 @@ export function isOpenRouterApiBase(apiBase: string): boolean {
   }
 }
 
+export async function createOpenRouterApiKey(
+  apiBase: string,
+  managementKey: string,
+  name: string
+): Promise<string> {
+  const url = `${apiBase.replace(/\/$/, "")}/keys`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${managementKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ name })
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`OpenRouter key create error ${res.status}: ${text}`);
+  }
+
+  const data = (await res.json()) as any;
+  const key = data?.data?.key ?? data?.key ?? data?.value?.key ?? data?.data?.value?.key;
+  if (typeof key !== "string" || key.trim().length === 0) {
+    throw new Error("OpenRouter key create response missing key.");
+  }
+  return key;
+}
+
 const modelsCache = new Map<string, Promise<OpenRouterModel[]>>();
 
 async function fetchOpenRouterModels(

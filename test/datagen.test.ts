@@ -60,6 +60,18 @@ test("parseArgs parses --reasoningEffort", () => {
   assert.equal(args.reasoningEffort, "high");
 });
 
+test("parseArgs parses --openrouter.isFree", () => {
+  const args = parseArgs([
+    "--model",
+    "m",
+    "--prompts",
+    "p.txt",
+    "--openrouter.isFree",
+    "true"
+  ]);
+  assert.equal(args.openrouterIsFree, true);
+});
+
 test("parseArgs supports --config YAML", async () => {
   const dir = await mkdtemp(join(tmpdir(), "datagen-"));
   const configPath = join(dir, "config.yaml");
@@ -76,6 +88,7 @@ test("parseArgs supports --config YAML", async () => {
       "store-system: false",
       "concurrent: 3",
       "openrouter:",
+      "  isFree: true",
       "  provider:",
       "    - openai",
       "    - anthropic",
@@ -93,6 +106,7 @@ test("parseArgs supports --config YAML", async () => {
   assert.equal(args.systemPrompt, "line1\nline2");
   assert.equal(args.storeSystem, false);
   assert.equal(args.concurrent, 3);
+  assert.equal(args.openrouterIsFree, true);
   assert.deepEqual(args.openrouterProviderOrder, ["openai", "anthropic"]);
   assert.equal(args.openrouterProviderSort, "throughput");
   assert.equal(args.reasoningEffort, "high");
