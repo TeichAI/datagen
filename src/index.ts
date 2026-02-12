@@ -5,6 +5,8 @@ import { countNonEmptyLines, ProgressBar } from "./progress.js";
 import { loadConfigRawArgs } from "./config.js";
 import {
   calculateOpenRouterSpendUSD,
+  createOpenRouterApiKey,
+  deleteOpenRouterApiKey,
   getOpenRouterModelPricing,
   isOpenRouterApiBase,
   type OpenRouterModelPricing,
@@ -84,6 +86,7 @@ const HELP_TEXT = [
   "  --system <text>                 Optional system prompt to include.",
   "  --store-system true|false       Whether to emit the system prompt in the dataset (default: true).",
   "  --concurrent <num>              Number of parallel requests (default: 1).",
+  "  --openrouter.isFree true|false  Treat API_KEY as a management key for free models.",
   "  --openrouter.provider <slugs>   OpenRouter provider slugs (comma-separated list).",
   "  --openrouter.providerSort <x>   Provider sorting order (price|throughput|latency).",
   "  --reasoningEffort <level>       Reasoning effort (none|minimal|low|medium|high|xhigh).",
@@ -124,6 +127,7 @@ export type Args = {
   concurrent: number;
   openrouterProviderOrder: string[] | null;
   openrouterProviderSort: string | null;
+  openrouterIsFree: boolean;
   reasoningEffort: string | null;
   timeout: number | null;
 };
@@ -168,7 +172,10 @@ function parseArgsFromRaw(args: Record<string, string | boolean>): Args {
     progressRaw === undefined
       ? true
       : String(progressRaw).toLowerCase() !== "false";
-  if (args["no-progress"] !== undefined) progress = false;
+  const noProgressRaw = args["no-progress"];
+  const noProgress =
+    noProgressRaw === undefined ? false : String(noProgressRaw).toLowerCase() !== "false";
+  if (noProgress) progress = false;
 
   const concurrentRaw = args.concurrent;
   const concurrentParsed =
@@ -194,6 +201,14 @@ function parseArgsFromRaw(args: Record<string, string | boolean>): Args {
       ? openrouterProviderSortRaw.trim()
       : null;
 
+  const openrouterIsFreeRaw = args["openrouter.isFree"] ?? args["openrouterIsFree"];
+  const openrouterIsFree =
+    openrouterIsFreeRaw === undefined
+      ? false
+      : typeof openrouterIsFreeRaw === "boolean"
+        ? openrouterIsFreeRaw
+        : String(openrouterIsFreeRaw).toLowerCase() === "true";
+
   const reasoningEffortRaw = args.reasoningEffort;
   const reasoningEffort =
     typeof reasoningEffortRaw === "string" && reasoningEffortRaw.trim().length > 0
@@ -210,7 +225,7 @@ function parseArgsFromRaw(args: Record<string, string | boolean>): Args {
 
   if (!model || !promptsPath) {
     throw new Error(
-      `${USAGE_LINE} [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system "..."] [--store-system true|false] [--concurrent 1] [--openrouter.provider openai,anthropic] [--openrouter.providerSort price|throughput|latency] [--reasoningEffort low|medium|high] [--timeout <ms>] [--no-progress]`
+      `${USAGE_LINE} [--out dataset.jsonl] [--api https://openrouter.ai/api/v1] [--system "..."] [--store-system true|false] [--concurrent 1] [--openrouter.isFree true|false] [--openrouter.provider openai,anthropic] [--openrouter.providerSort price|throughput|latency] [--reasoningEffort low|medium|high] [--timeout <ms>] [--no-progress]`
     );
   }
 
@@ -225,6 +240,7 @@ function parseArgsFromRaw(args: Record<string, string | boolean>): Args {
     concurrent,
     openrouterProviderOrder,
     openrouterProviderSort,
+    openrouterIsFree,
     reasoningEffort,
     timeout
   };
@@ -420,6 +436,7 @@ export async function main(argv = process.argv.slice(2)) {
     concurrent,
     openrouterProviderOrder,
     openrouterProviderSort,
+    openrouterIsFree,
     reasoningEffort,
     timeout
   } = parsed;
@@ -452,8 +469,84 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const bar =
     useProgress && totalPrompts > 0 ? new ProgressBar(totalPrompts, process.stderr) : null;
+  const writeLine = (msg: string) => {
+    if (bar) bar.writeLine(msg);
+    else process.stderr.write(msg + "\n");
+  };
 
   const isOpenRouter = isOpenRouterApiBase(apiBase);
+  const useFreeKeys = isOpenRouter && openrouterIsFree;
+  const maxConcurrent = Math.max(1, concurrent);
+  if (useFreeKeys) {
+    const msg =
+      "INFO: openrouter.isFree is enabled. API_KEY must be an OpenRouter management key to create per-request keys.";
+    writeLine(msg);
+  }
+  let requestKeys = [apiKey];
+  let spawnedKeyHashes: string[] = [];
+  if (useFreeKeys) {
+    const baseName = `datagen-${Date.now()}`;
+    try {
+      const createdKeys = await Promise.all(
+        Array.from({ length: maxConcurrent }, (_, idx) =>
+          createOpenRouterApiKey(apiBase, apiKey, `${baseName}-${idx + 1}`)
+        )
+      );
+      requestKeys = createdKeys.map((item) => item.key);
+      spawnedKeyHashes = createdKeys
+        .map((item) => item.hash)
+        .filter((hash): hash is string => typeof hash === "string");
+    } catch (err: any) {
+      const details = err?.message ?? String(err);
+      console.error(
+        `Key creation failed. Please make sure the API_KEY you provided is a management key. ${details}`
+      );
+      console.error("Create one at https://openrouter.ai/settings/management-keys");
+      process.exit(1);
+      return;
+    }
+  }
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const deleteKeyWithRetry = async (hash: string) => {
+    const delays = [250, 500, 1000, 2000];
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      try {
+        await deleteOpenRouterApiKey(apiBase, apiKey, hash);
+        return;
+      } catch (err) {
+        lastError = err;
+        if (attempt < delays.length) {
+          await sleep(delays[attempt]);
+        }
+      }
+    }
+    const msg = `WARN: Failed to delete key ${hash}: ${
+      (lastError as any)?.message ?? String(lastError)
+    }`;
+    writeLine(msg);
+  };
+  let cleanupStarted = false;
+  const cleanupKeys = async () => {
+    if (!useFreeKeys) return;
+    const hashes = new Set(spawnedKeyHashes);
+    if (hashes.size === 0) return;
+    for (const hash of hashes) {
+      await deleteKeyWithRetry(hash);
+    }
+  };
+  const handleTermination = () => {
+    if (cleanupStarted) return;
+    cleanupStarted = true;
+    writeLine("Cleaning up processes and exiting.");
+    void cleanupKeys().finally(() => {
+      process.exit(1);
+    });
+  };
+  process.once("SIGINT", handleTermination);
+  process.once("SIGTERM", handleTermination);
+  process.once("SIGQUIT", handleTermination);
+  const pricingKey = requestKeys[0];
   const providerPref =
     isOpenRouter && (openrouterProviderOrder || openrouterProviderSort)
       ? {
@@ -464,7 +557,7 @@ export async function main(argv = process.argv.slice(2)) {
   let pricing: OpenRouterModelPricing | null = null;
   if (isOpenRouter) {
     try {
-      pricing = await getOpenRouterModelPricing(apiBase, apiKey, model);
+      pricing = await getOpenRouterModelPricing(apiBase, pricingKey, model);
       if (!pricing) {
         const msg = `WARN: Could not find pricing for model "${model}" on OpenRouter.`;
         if (bar) bar.writeLine(msg);
@@ -527,7 +620,6 @@ export async function main(argv = process.argv.slice(2)) {
     });
 
   const inFlight = new Set<Promise<void>>();
-  const maxConcurrent = Math.max(1, concurrent);
 
   let writeQueue = Promise.resolve();
   const writeJsonlLine = (line: string) => {
@@ -552,12 +644,33 @@ export async function main(argv = process.argv.slice(2)) {
     });
   };
 
+  const useKeyPool = useFreeKeys && requestKeys.length > 0;
+  const availableKeys = useKeyPool ? [...requestKeys] : [];
+  const keyWaiters: Array<(key: string) => void> = [];
+  const acquireKey = async () => {
+    if (!useKeyPool) return requestKeys[0];
+    if (availableKeys.length > 0) return availableKeys.shift() as string;
+    return await new Promise<string>((resolve) => {
+      keyWaiters.push(resolve);
+    });
+  };
+  const releaseKey = (key: string) => {
+    if (!useKeyPool) return;
+    const waiter = keyWaiters.shift();
+    if (waiter) waiter(key);
+    else availableKeys.push(key);
+  };
+
   const schedule = (index: number, line: number, prompt: string) => {
     const p = (async () => {
+      let requestKey = requestKeys[0];
+      if (useKeyPool) {
+        requestKey = await acquireKey();
+      }
       try {
         const { content, reasoning, usage } = await callOpenRouter(
           apiBase,
-          apiKey,
+          requestKey,
           model,
           systemPrompt,
           prompt,
@@ -586,6 +699,7 @@ export async function main(argv = process.argv.slice(2)) {
         else process.stderr.write(msg + "\n");
         errCount++;
       } finally {
+        releaseKey(requestKey);
         completed++;
         renderProgress();
       }
@@ -616,6 +730,7 @@ export async function main(argv = process.argv.slice(2)) {
     await Promise.race(inFlight);
   }
 
+  await cleanupKeys();
   out.end();
   if (bar) {
     bar.finish(completed, {
