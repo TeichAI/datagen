@@ -680,6 +680,7 @@ export async function main(argv = process.argv.slice(2)) {
     rl?.close();
     void (async () => {
       await waitForActiveRequests();
+      writeLine("All in-flight requests have been safely exited, cleaning up keys...");
       await cleanupKeys();
       closeOutput();
       process.exit(1);
