@@ -15,6 +15,8 @@ import {
 import packageJson from "../package.json" with { type: "json" };
 import { maybeNotifyNewVersion } from "./update-check.js";
 
+const rateLimitState = new Map<string, number>();
+
 function trimTrailingZeros(num: string): string {
   if (!num.includes(".")) return num;
   const trimmed = num.replace(/(?:\.0+|(\.\d*?)0+)$/, "$1");
@@ -327,6 +329,31 @@ export async function callOpenRouter(
   const reasoningPref =
     reasoningEffortPref ? { effort: reasoningEffortPref } : undefined;
 
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const maxRetries = 5;
+  const rateKey = `${apiBase}|${model}`;
+  const parseResetMs = (value: string | null): number | null => {
+    if (!value) return null;
+    const num = Number(value);
+    if (!Number.isFinite(num)) return null;
+    return num < 1_000_000_000_000 ? num * 1000 : num;
+  };
+  const updateRateLimit = (resetMs: number | null) => {
+    if (!resetMs) return;
+    const next = resetMs + 250;
+    const current = rateLimitState.get(rateKey);
+    if (current === undefined || next > current) {
+      rateLimitState.set(rateKey, next);
+    }
+  };
+  const waitForRateLimit = async () => {
+    const now = Date.now();
+    const waitUntil = rateLimitState.get(rateKey);
+    if (waitUntil && waitUntil > now) {
+      await sleep(waitUntil - now);
+    }
+  };
+
   const controller = typeof timeout === "number" && timeout > 0 ? new AbortController() : undefined;
   const timeoutId =
     controller && typeof timeout === "number" && timeout > 0
@@ -334,44 +361,65 @@ export async function callOpenRouter(
       : undefined;
 
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        ...(reasoningPref ? { reasoning: reasoningPref } : {}),
-        ...(providerPref ? { provider: providerPref } : {})
-      }),
-      signal: controller?.signal
-    });
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      await waitForRateLimit();
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          ...(reasoningPref ? { reasoning: reasoningPref } : {}),
+          ...(providerPref ? { provider: providerPref } : {})
+        }),
+        signal: controller?.signal
+      });
 
-    if (timeoutId !== undefined) clearTimeout(timeoutId);
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`OpenRouter error ${res.status}: ${text}`);
+      if (!res.ok) {
+        if (res.status === 429 && attempt < maxRetries) {
+          const resetMs = parseResetMs(res.headers?.get?.("x-ratelimit-reset") ?? null);
+          updateRateLimit(resetMs);
+          const nowMs = Date.now();
+          const waitMs = resetMs && resetMs > nowMs ? resetMs - nowMs + 250 : 1000 * (attempt + 1);
+          await sleep(waitMs);
+          continue;
+        }
+        const text = await res.text().catch(() => "");
+        throw new Error(`OpenRouter error ${res.status}: ${text}`);
+      }
+
+      const remainingRaw = res.headers?.get?.("x-ratelimit-remaining") ?? null;
+      const remaining = remainingRaw ? Number(remainingRaw) : NaN;
+      if (Number.isFinite(remaining) && remaining <= 0) {
+        const resetMs = parseResetMs(res.headers?.get?.("x-ratelimit-reset") ?? null);
+        updateRateLimit(resetMs);
+      }
+
+      const data = (await res.json()) as any;
+      const choice = data?.choices?.[0];
+      const message = choice?.message ?? choice?.delta ?? {};
+      const content = message?.content ?? "";
+      const reasoning =
+        message?.reasoning ??
+        choice?.reasoning ??
+        data?.reasoning ??
+        undefined;
+      const usage = data?.usage as OpenRouterUsage | undefined;
+
+      if (typeof content !== "string" || !content.length) {
+        throw new Error("No assistant content returned from OpenRouter.");
+      }
+
+      return { content, reasoning, usage };
     }
 
-    const data = (await res.json()) as any;
-    const choice = data?.choices?.[0];
-    const message = choice?.message ?? choice?.delta ?? {};
-    const content = message?.content ?? "";
-    const reasoning =
-      message?.reasoning ??
-      choice?.reasoning ??
-      data?.reasoning ??
-      undefined;
-    const usage = data?.usage as OpenRouterUsage | undefined;
-
-    if (typeof content !== "string" || !content.length) {
-      throw new Error("No assistant content returned from OpenRouter.");
-    }
-
-    return { content, reasoning, usage };
+    throw lastError ?? new Error("OpenRouter rate limit retries exhausted.");
   } catch (err: any) {
     if (timeoutId !== undefined) clearTimeout(timeoutId);
     if (err?.name === "AbortError") {
