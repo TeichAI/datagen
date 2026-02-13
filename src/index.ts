@@ -532,6 +532,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   let requestKeys = [apiKey];
   let spawnedKeyHashes: string[] = [];
+  let stopScheduling = false;
   if (useFreeKeys) {
     const baseName = `datagen-${Date.now()}`;
     try {
@@ -574,7 +575,6 @@ export async function main(argv = process.argv.slice(2)) {
     }`;
     writeLine(msg);
   };
-  let cleanupStarted = false;
   const cleanupKeys = async () => {
     if (!useFreeKeys) return;
     const hashes = new Set(spawnedKeyHashes);
@@ -583,17 +583,7 @@ export async function main(argv = process.argv.slice(2)) {
       await deleteKeyWithRetry(hash);
     }
   };
-  const handleTermination = () => {
-    if (cleanupStarted) return;
-    cleanupStarted = true;
-    writeLine("Cleaning up processes and exiting.");
-    void cleanupKeys().finally(() => {
-      process.exit(1);
-    });
-  };
-  process.once("SIGINT", handleTermination);
-  process.once("SIGTERM", handleTermination);
-  process.once("SIGQUIT", handleTermination);
+  let rl: ReturnType<typeof createInterface> | null = null;
   const pricingKey = requestKeys[0];
   const providerPref =
     isOpenRouter && (openrouterProviderOrder || openrouterProviderSort)
@@ -645,12 +635,19 @@ export async function main(argv = process.argv.slice(2)) {
     }
   }
 
-  const rl = createInterface({
+  rl = createInterface({
     input: createReadStream(absPromptsPath),
     crlfDelay: Infinity
   });
+  const promptReader = rl;
 
   const out = createWriteStream(absOutPath, { flags: "w" });
+  let outputClosed = false;
+  const closeOutput = () => {
+    if (outputClosed) return;
+    out.end();
+    outputClosed = true;
+  };
 
   let lineNum = 0;
   let completed = 0;
@@ -668,6 +665,30 @@ export async function main(argv = process.argv.slice(2)) {
     });
 
   const inFlight = new Set<Promise<void>>();
+  const waitForActiveRequests = async () => {
+    while (inFlight.size > 0) {
+      await Promise.race(inFlight);
+    }
+  };
+
+  let shuttingDown = false;
+  const initiateShutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    stopScheduling = true;
+    writeLine("Received termination signal. Waiting for in-flight requests to finish before cleanup.");
+    rl?.close();
+    void (async () => {
+      await waitForActiveRequests();
+      await cleanupKeys();
+      closeOutput();
+      process.exit(1);
+    })();
+  };
+
+  process.once("SIGINT", initiateShutdown);
+  process.once("SIGTERM", initiateShutdown);
+  process.once("SIGQUIT", initiateShutdown);
 
   let writeQueue = Promise.resolve();
   const writeJsonlLine = (line: string) => {
@@ -758,28 +779,36 @@ export async function main(argv = process.argv.slice(2)) {
   };
 
   const waitForSlot = async () => {
+    if (stopScheduling) return;
     while (inFlight.size >= maxConcurrent) {
       await Promise.race(inFlight);
+      if (stopScheduling) return;
     }
   };
 
   let promptIndex = 0;
-  for await (const line of rl) {
-    lineNum++;
-    const prompt = line.trim();
-    if (!prompt) continue;
+  try {
+    for await (const line of promptReader) {
+      lineNum++;
+      const prompt = line.trim();
+      if (!prompt) continue;
 
-    await waitForSlot();
-    schedule(promptIndex, lineNum, prompt);
-    promptIndex++;
+      if (stopScheduling) break;
+
+      await waitForSlot();
+      if (stopScheduling) break;
+      schedule(promptIndex, lineNum, prompt);
+      promptIndex++;
+    }
+  } catch (err) {
+    if (!shuttingDown) throw err;
   }
 
-  while (inFlight.size > 0) {
-    await Promise.race(inFlight);
-  }
+  await waitForActiveRequests();
+  if (shuttingDown) return;
 
   await cleanupKeys();
-  out.end();
+  closeOutput();
   if (bar) {
     bar.finish(completed, {
       ok: okCount,
