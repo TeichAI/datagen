@@ -399,6 +399,286 @@ export async function ensureReadableFile(filePath: string) {
   await fs.access(filePath);
 }
 
+export type GenerateDatasetOptions = Args & {
+  apiKey: string;
+  stderr?: NodeJS.WriteStream;
+};
+
+export type GenerateDatasetResult = {
+  outPath: string;
+  completed: number;
+  okCount: number;
+  errCount: number;
+  spentUsd: number;
+};
+
+export async function generateDataset(options: GenerateDatasetOptions): Promise<GenerateDatasetResult> {
+  const {
+    model,
+    promptsPath,
+    outPath,
+    apiBase,
+    systemPrompt,
+    storeSystem,
+    progress,
+    concurrent,
+    openrouterProviderOrder,
+    openrouterProviderSort,
+    openrouterIsFree,
+    reasoningEffort,
+    timeout,
+    apiKey,
+    stderr = process.stderr
+  } = options;
+
+  const absPromptsPath = resolve(promptsPath);
+  const absOutPath = resolve(outPath);
+  await ensureReadableFile(absPromptsPath);
+
+  const useProgress = progress && Boolean(stderr.isTTY);
+  let totalPrompts = 0;
+  if (useProgress) {
+    try {
+      totalPrompts = await countNonEmptyLines(absPromptsPath);
+    } catch {
+      totalPrompts = 0;
+    }
+  }
+  const bar = useProgress && totalPrompts > 0 ? new ProgressBar(totalPrompts, stderr) : null;
+  const writeLine = (msg: string) => {
+    if (bar) bar.writeLine(msg);
+    else stderr.write(msg + "\n");
+  };
+
+  const isOpenRouter = isOpenRouterApiBase(apiBase);
+  const useFreeKeys = isOpenRouter && openrouterIsFree;
+  const maxConcurrent = Math.max(1, concurrent);
+  if (useFreeKeys) {
+    writeLine(
+      "INFO: openrouter.isFree is enabled. API_KEY must be an OpenRouter management key to create per-request keys."
+    );
+  }
+  let requestKeys = [apiKey];
+  let spawnedKeyHashes: string[] = [];
+  if (useFreeKeys) {
+    const baseName = `datagen-${Date.now()}`;
+    const createdKeys = await Promise.all(
+      Array.from({ length: maxConcurrent }, (_, idx) =>
+        createOpenRouterApiKey(apiBase, apiKey, `${baseName}-${idx + 1}`)
+      )
+    );
+    requestKeys = createdKeys.map((item) => item.key);
+    spawnedKeyHashes = createdKeys
+      .map((item) => item.hash)
+      .filter((hash): hash is string => typeof hash === "string");
+  }
+
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const deleteKeyWithRetry = async (hash: string) => {
+    const delays = [250, 500, 1000, 2000];
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      try {
+        await deleteOpenRouterApiKey(apiBase, apiKey, hash);
+        return;
+      } catch (err) {
+        lastError = err;
+        if (attempt < delays.length) {
+          await sleep(delays[attempt]);
+        }
+      }
+    }
+    writeLine(`WARN: Failed to delete key ${hash}: ${(lastError as any)?.message ?? String(lastError)}`);
+  };
+
+  const cleanupKeys = async () => {
+    if (!useFreeKeys) return;
+    const hashes = new Set(spawnedKeyHashes);
+    if (hashes.size === 0) return;
+    for (const hash of hashes) {
+      await deleteKeyWithRetry(hash);
+    }
+  };
+
+  try {
+    const pricingKey = requestKeys[0];
+    const providerPref =
+      isOpenRouter && (openrouterProviderOrder || openrouterProviderSort)
+        ? {
+            ...(openrouterProviderOrder ? { order: openrouterProviderOrder } : {}),
+            ...(openrouterProviderSort ? { sort: openrouterProviderSort } : {})
+          }
+        : undefined;
+    let pricing: OpenRouterModelPricing | null = null;
+    if (isOpenRouter) {
+      try {
+        pricing = await getOpenRouterModelPricing(apiBase, pricingKey, model);
+        if (!pricing) {
+          writeLine(`WARN: Could not find pricing for model "${model}" on OpenRouter.`);
+        }
+      } catch (err: any) {
+        writeLine(`WARN: Failed to fetch OpenRouter models/pricing: ${err?.message ?? String(err)}`);
+      }
+    }
+
+    if (pricing) {
+      const lines = [
+        `Model: ${model}`,
+        `API: ${apiBase}`,
+        pricing.modelId !== model ? `OpenRouter pricing model: ${pricing.modelId}` : null,
+        providerPref ? `OpenRouter provider prefs: ${JSON.stringify(providerPref)}` : null,
+        reasoningEffort ? `Reasoning effort: ${reasoningEffort}` : null,
+        `Pricing (USD per 1M tokens): prompt=${formatUsdPerMillionTokens(pricing.known.prompt, pricing.raw.prompt, pricing.promptPerTokenUSD)} completion=${formatUsdPerMillionTokens(pricing.known.completion, pricing.raw.completion, pricing.completionPerTokenUSD)}`,
+        `Pricing (USD per token): prompt=${formatUsdOrUnknown(pricing.known.prompt, pricing.raw.prompt, pricing.promptPerTokenUSD)}/token completion=${formatUsdOrUnknown(pricing.known.completion, pricing.raw.completion, pricing.completionPerTokenUSD)}/token`,
+        `Pricing (USD per request): request=${formatUsdOrUnknown(pricing.known.request, pricing.raw.request, pricing.requestUSD)}/request`
+      ].filter((l): l is string => Boolean(l));
+      for (const l of lines) {
+        writeLine(l);
+      }
+      if (!pricing.known.prompt || !pricing.known.completion) {
+        writeLine(
+          "WARN: OpenRouter did not provide token pricing for this model; spent total will be omitted."
+        );
+      }
+    }
+
+    const rl = createInterface({
+      input: createReadStream(absPromptsPath),
+      crlfDelay: Infinity
+    });
+    const out = createWriteStream(absOutPath, { flags: "w" });
+
+    let lineNum = 0;
+    let completed = 0;
+    let okCount = 0;
+    let errCount = 0;
+    let spentUsd = 0;
+    const canTrackSpend = Boolean(
+      pricing && pricing.known.prompt && pricing.known.completion && pricing.known.request
+    );
+    if (bar) bar.render(0, { ok: 0, err: 0, spentUsd: canTrackSpend ? spentUsd : undefined });
+
+    const inFlight = new Set<Promise<void>>();
+    let writeQueue = Promise.resolve();
+    const writeJsonlLine = (line: string) => {
+      writeQueue = writeQueue.then(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            out.write(line, (err) => {
+              if (err) reject(err);
+              else resolve();
+            });
+          })
+      );
+      return writeQueue;
+    };
+
+    const renderProgress = () => {
+      if (!bar) return;
+      bar.render(completed, {
+        ok: okCount,
+        err: errCount,
+        spentUsd: canTrackSpend ? spentUsd : undefined
+      });
+    };
+
+    const useKeyPool = useFreeKeys && requestKeys.length > 0;
+    const availableKeys = useKeyPool ? [...requestKeys] : [];
+    const keyWaiters: Array<(key: string) => void> = [];
+    const acquireKey = async () => {
+      if (!useKeyPool) return requestKeys[0];
+      if (availableKeys.length > 0) return availableKeys.shift() as string;
+      return await new Promise<string>((resolve) => {
+        keyWaiters.push(resolve);
+      });
+    };
+    const releaseKey = (key: string) => {
+      if (!useKeyPool) return;
+      const waiter = keyWaiters.shift();
+      if (waiter) waiter(key);
+      else availableKeys.push(key);
+    };
+
+    const schedule = (line: number, prompt: string) => {
+      const p = (async () => {
+        let requestKey = requestKeys[0];
+        if (useKeyPool) {
+          requestKey = await acquireKey();
+        }
+        try {
+          const { content, reasoning, usage } = await callOpenRouter(
+            apiBase,
+            requestKey,
+            model,
+            systemPrompt,
+            prompt,
+            providerPref,
+            reasoningEffort,
+            timeout
+          );
+
+          if (canTrackSpend && pricing) {
+            spentUsd += calculateOpenRouterSpendUSD(pricing, usage);
+          }
+
+          const assistantContent = formatAssistantContent(content, reasoning);
+          const messages = buildOutputMessages(systemPrompt, prompt, assistantContent, storeSystem);
+          await writeJsonlLine(JSON.stringify({ messages }) + "\n");
+          okCount++;
+        } catch (err: any) {
+          writeLine(`ERR line ${line}: ${err?.message ?? String(err)}`);
+          errCount++;
+        } finally {
+          releaseKey(requestKey);
+          completed++;
+          renderProgress();
+        }
+      })();
+
+      inFlight.add(p);
+      p.finally(() => inFlight.delete(p));
+    };
+
+    const waitForSlot = async () => {
+      while (inFlight.size >= maxConcurrent) {
+        await Promise.race(inFlight);
+      }
+    };
+
+    for await (const line of rl) {
+      lineNum++;
+      const prompt = line.trim();
+      if (!prompt) continue;
+      await waitForSlot();
+      schedule(lineNum, prompt);
+    }
+
+    while (inFlight.size > 0) {
+      await Promise.race(inFlight);
+    }
+
+    await writeQueue;
+    await new Promise<void>((resolve, reject) => {
+      out.end((err?: Error | null) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    if (bar) {
+      bar.finish(completed, {
+        ok: okCount,
+        err: errCount,
+        spentUsd: canTrackSpend ? spentUsd : undefined
+      });
+    }
+
+    return { outPath: absOutPath, completed, okCount, errCount, spentUsd };
+  } finally {
+    await cleanupKeys();
+  }
+}
+
 export async function main(argv = process.argv.slice(2)) {
   await maybeNotifyNewVersion({
     cliName: CLI_NAME,
@@ -425,318 +705,19 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
 
-  const {
-    model,
-    promptsPath,
-    outPath,
-    apiBase,
-    systemPrompt,
-    storeSystem,
-    progress,
-    concurrent,
-    openrouterProviderOrder,
-    openrouterProviderSort,
-    openrouterIsFree,
-    reasoningEffort,
-    timeout
-  } = parsed;
-
   const apiKey = process.env.API_KEY;
   if (!apiKey) {
     console.error('Missing env var "API_KEY".');
     process.exit(1);
   }
 
-  const absPromptsPath = resolve(promptsPath);
-  const absOutPath = resolve(outPath);
-
   try {
-    await ensureReadableFile(absPromptsPath);
+    await generateDataset({
+      ...parsed,
+      apiKey
+    });
   } catch (err: any) {
     console.error(err?.message ?? String(err));
     process.exit(1);
-    return;
-  }
-
-  const useProgress = progress && Boolean(process.stderr.isTTY);
-  let totalPrompts = 0;
-  if (useProgress) {
-    try {
-      totalPrompts = await countNonEmptyLines(absPromptsPath);
-    } catch {
-      totalPrompts = 0;
-    }
-  }
-  const bar =
-    useProgress && totalPrompts > 0 ? new ProgressBar(totalPrompts, process.stderr) : null;
-  const writeLine = (msg: string) => {
-    if (bar) bar.writeLine(msg);
-    else process.stderr.write(msg + "\n");
-  };
-
-  const isOpenRouter = isOpenRouterApiBase(apiBase);
-  const useFreeKeys = isOpenRouter && openrouterIsFree;
-  const maxConcurrent = Math.max(1, concurrent);
-  if (useFreeKeys) {
-    const msg =
-      "INFO: openrouter.isFree is enabled. API_KEY must be an OpenRouter management key to create per-request keys.";
-    writeLine(msg);
-  }
-  let requestKeys = [apiKey];
-  let spawnedKeyHashes: string[] = [];
-  if (useFreeKeys) {
-    const baseName = `datagen-${Date.now()}`;
-    try {
-      const createdKeys = await Promise.all(
-        Array.from({ length: maxConcurrent }, (_, idx) =>
-          createOpenRouterApiKey(apiBase, apiKey, `${baseName}-${idx + 1}`)
-        )
-      );
-      requestKeys = createdKeys.map((item) => item.key);
-      spawnedKeyHashes = createdKeys
-        .map((item) => item.hash)
-        .filter((hash): hash is string => typeof hash === "string");
-    } catch (err: any) {
-      const details = err?.message ?? String(err);
-      console.error(
-        `Key creation failed. Please make sure the API_KEY you provided is a management key. ${details}`
-      );
-      console.error("Create one at https://openrouter.ai/settings/management-keys");
-      process.exit(1);
-      return;
-    }
-  }
-  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-  const deleteKeyWithRetry = async (hash: string) => {
-    const delays = [250, 500, 1000, 2000];
-    let lastError: unknown;
-    for (let attempt = 0; attempt <= delays.length; attempt++) {
-      try {
-        await deleteOpenRouterApiKey(apiBase, apiKey, hash);
-        return;
-      } catch (err) {
-        lastError = err;
-        if (attempt < delays.length) {
-          await sleep(delays[attempt]);
-        }
-      }
-    }
-    const msg = `WARN: Failed to delete key ${hash}: ${
-      (lastError as any)?.message ?? String(lastError)
-    }`;
-    writeLine(msg);
-  };
-  let cleanupStarted = false;
-  const cleanupKeys = async () => {
-    if (!useFreeKeys) return;
-    const hashes = new Set(spawnedKeyHashes);
-    if (hashes.size === 0) return;
-    for (const hash of hashes) {
-      await deleteKeyWithRetry(hash);
-    }
-  };
-  const handleTermination = () => {
-    if (cleanupStarted) return;
-    cleanupStarted = true;
-    writeLine("Cleaning up processes and exiting.");
-    void cleanupKeys().finally(() => {
-      process.exit(1);
-    });
-  };
-  process.once("SIGINT", handleTermination);
-  process.once("SIGTERM", handleTermination);
-  process.once("SIGQUIT", handleTermination);
-  const pricingKey = requestKeys[0];
-  const providerPref =
-    isOpenRouter && (openrouterProviderOrder || openrouterProviderSort)
-      ? {
-          ...(openrouterProviderOrder ? { order: openrouterProviderOrder } : {}),
-          ...(openrouterProviderSort ? { sort: openrouterProviderSort } : {})
-        }
-      : undefined;
-  let pricing: OpenRouterModelPricing | null = null;
-  if (isOpenRouter) {
-    try {
-      pricing = await getOpenRouterModelPricing(apiBase, pricingKey, model);
-      if (!pricing) {
-        const msg = `WARN: Could not find pricing for model "${model}" on OpenRouter.`;
-        if (bar) bar.writeLine(msg);
-        else process.stderr.write(msg + "\n");
-      }
-    } catch (err: any) {
-      const msg = `WARN: Failed to fetch OpenRouter models/pricing: ${err?.message ?? String(err)}`;
-      if (bar) bar.writeLine(msg);
-      else process.stderr.write(msg + "\n");
-    }
-  }
-
-  if (pricing) {
-    const lines = [
-      `Model: ${model}`,
-      `API: ${apiBase}`,
-      pricing.modelId !== model
-        ? `OpenRouter pricing model: ${pricing.modelId}`
-        : null,
-      providerPref
-        ? `OpenRouter provider prefs: ${JSON.stringify(providerPref)}`
-        : null,
-      reasoningEffort ? `Reasoning effort: ${reasoningEffort}` : null,
-      `Pricing (USD per 1M tokens): prompt=${formatUsdPerMillionTokens(pricing.known.prompt, pricing.raw.prompt, pricing.promptPerTokenUSD)} completion=${formatUsdPerMillionTokens(pricing.known.completion, pricing.raw.completion, pricing.completionPerTokenUSD)}`,
-      `Pricing (USD per token): prompt=${formatUsdOrUnknown(pricing.known.prompt, pricing.raw.prompt, pricing.promptPerTokenUSD)}/token completion=${formatUsdOrUnknown(pricing.known.completion, pricing.raw.completion, pricing.completionPerTokenUSD)}/token`,
-      `Pricing (USD per request): request=${formatUsdOrUnknown(pricing.known.request, pricing.raw.request, pricing.requestUSD)}/request`
-    ].filter((l): l is string => Boolean(l));
-    for (const l of lines) {
-      if (bar) bar.writeLine(l);
-      else process.stderr.write(l + "\n");
-    }
-
-    if (!pricing.known.prompt || !pricing.known.completion) {
-      const msg = "WARN: OpenRouter did not provide token pricing for this model; spent total will be omitted.";
-      if (bar) bar.writeLine(msg);
-      else process.stderr.write(msg + "\n");
-    }
-  }
-
-  const rl = createInterface({
-    input: createReadStream(absPromptsPath),
-    crlfDelay: Infinity
-  });
-
-  const out = createWriteStream(absOutPath, { flags: "w" });
-
-  let lineNum = 0;
-  let completed = 0;
-  let okCount = 0;
-  let errCount = 0;
-  let spentUsd = 0;
-  const canTrackSpend = Boolean(
-    pricing && pricing.known.prompt && pricing.known.completion && pricing.known.request
-  );
-  if (bar)
-    bar.render(0, {
-      ok: 0,
-      err: 0,
-      spentUsd: canTrackSpend ? spentUsd : undefined
-    });
-
-  const inFlight = new Set<Promise<void>>();
-
-  let writeQueue = Promise.resolve();
-  const writeJsonlLine = (line: string) => {
-    writeQueue = writeQueue.then(
-      () =>
-        new Promise<void>((resolve, reject) => {
-          out.write(line, (err) => {
-            if (err) reject(err);
-            else resolve();
-          });
-        })
-    );
-    return writeQueue;
-  };
-
-  const renderProgress = () => {
-    if (!bar) return;
-    bar.render(completed, {
-      ok: okCount,
-      err: errCount,
-      spentUsd: canTrackSpend ? spentUsd : undefined
-    });
-  };
-
-  const useKeyPool = useFreeKeys && requestKeys.length > 0;
-  const availableKeys = useKeyPool ? [...requestKeys] : [];
-  const keyWaiters: Array<(key: string) => void> = [];
-  const acquireKey = async () => {
-    if (!useKeyPool) return requestKeys[0];
-    if (availableKeys.length > 0) return availableKeys.shift() as string;
-    return await new Promise<string>((resolve) => {
-      keyWaiters.push(resolve);
-    });
-  };
-  const releaseKey = (key: string) => {
-    if (!useKeyPool) return;
-    const waiter = keyWaiters.shift();
-    if (waiter) waiter(key);
-    else availableKeys.push(key);
-  };
-
-  const schedule = (index: number, line: number, prompt: string) => {
-    const p = (async () => {
-      let requestKey = requestKeys[0];
-      if (useKeyPool) {
-        requestKey = await acquireKey();
-      }
-      try {
-        const { content, reasoning, usage } = await callOpenRouter(
-          apiBase,
-          requestKey,
-          model,
-          systemPrompt,
-          prompt,
-          providerPref,
-          reasoningEffort,
-          timeout
-        );
-
-        if (canTrackSpend && pricing) {
-          spentUsd += calculateOpenRouterSpendUSD(pricing, usage);
-        }
-
-        const assistantContent = formatAssistantContent(content, reasoning);
-        const messages = buildOutputMessages(
-          systemPrompt,
-          prompt,
-          assistantContent,
-          storeSystem
-        );
-
-        await writeJsonlLine(JSON.stringify({ messages }) + "\n");
-        okCount++;
-      } catch (err: any) {
-        const msg = `ERR line ${line}: ${err?.message ?? String(err)}`;
-        if (bar) bar.writeLine(msg);
-        else process.stderr.write(msg + "\n");
-        errCount++;
-      } finally {
-        releaseKey(requestKey);
-        completed++;
-        renderProgress();
-      }
-    })();
-
-    inFlight.add(p);
-    p.finally(() => inFlight.delete(p));
-  };
-
-  const waitForSlot = async () => {
-    while (inFlight.size >= maxConcurrent) {
-      await Promise.race(inFlight);
-    }
-  };
-
-  let promptIndex = 0;
-  for await (const line of rl) {
-    lineNum++;
-    const prompt = line.trim();
-    if (!prompt) continue;
-
-    await waitForSlot();
-    schedule(promptIndex, lineNum, prompt);
-    promptIndex++;
-  }
-
-  while (inFlight.size > 0) {
-    await Promise.race(inFlight);
-  }
-
-  await cleanupKeys();
-  out.end();
-  if (bar) {
-    bar.finish(completed, {
-      ok: okCount,
-      err: errCount,
-      spentUsd: canTrackSpend ? spentUsd : undefined
-    });
   }
 }

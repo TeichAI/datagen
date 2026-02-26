@@ -9,8 +9,10 @@ import {
   buildOutputMessages,
   formatAssistantContent,
   callOpenRouter,
-  ensureReadableFile
+  ensureReadableFile,
+  generateDataset
 } from "../src/index.js";
+import { readFile } from "node:fs/promises";
 
 test("parseArgs requires model and prompts", () => {
   assert.throws(() => parseArgs([]), /Usage:/);
@@ -320,4 +322,61 @@ test("ensureReadableFile throws if missing or not a file", async () => {
   const file = join(dir, "prompts.txt");
   await writeFile(file, "hello\n");
   await ensureReadableFile(file);
+});
+
+test("generateDataset writes JSONL output for prompts", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "datagen-"));
+  const promptsPath = join(dir, "prompts.txt");
+  const outPath = join(dir, "dataset.jsonl");
+  await writeFile(promptsPath, "first\n\nsecond\n");
+
+  globalThis.fetch = async () => {
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "assistant"
+              }
+            }
+          ]
+        };
+      }
+    } as any;
+  };
+
+  const result = await generateDataset({
+    model: "model-x",
+    promptsPath,
+    outPath,
+    apiBase: "https://example.com/api/v1",
+    systemPrompt: "",
+    storeSystem: true,
+    progress: false,
+    concurrent: 1,
+    openrouterProviderOrder: null,
+    openrouterProviderSort: null,
+    openrouterIsFree: false,
+    reasoningEffort: null,
+    timeout: null,
+    apiKey: "KEY"
+  });
+
+  assert.equal(result.completed, 2);
+  assert.equal(result.okCount, 2);
+  assert.equal(result.errCount, 0);
+
+  const content = await readFile(outPath, "utf8");
+  const lines = content.trim().split("\n");
+  assert.equal(lines.length, 2);
+  const parsed = lines.map((line) => JSON.parse(line));
+  assert.deepEqual(parsed[0], {
+    messages: [
+      { role: "user", content: "first" },
+      { role: "assistant", content: "assistant" }
+    ]
+  });
 });
