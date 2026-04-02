@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,7 +12,8 @@ import {
   generateDatasetReadmeTemplate,
   resolveDatasetReadmePath,
   callOpenRouter,
-  ensureReadableFile
+  ensureReadableFile,
+  main
 } from "../src/index.js";
 
 test("parseArgs requires model and prompts", () => {
@@ -411,6 +412,115 @@ test("callOpenRouter reasoning.effort works for non-OpenRouter apiBase", async (
   assert.equal(calls.length, 1);
   const body = JSON.parse(calls[0].init.body);
   assert.deepEqual(body.reasoning, { effort: "minimal" });
+});
+
+test("main writes new assistant format by default", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "datagen-"));
+  const promptsPath = join(dir, "prompts.txt");
+  const outPath = join(dir, "dataset.jsonl");
+  await writeFile(promptsPath, "hello\n");
+
+  const originalApiKey = process.env.API_KEY;
+  process.env.API_KEY = "KEY";
+
+  globalThis.fetch = async () =>
+    ({
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "answer",
+                reasoning: "reasoning here"
+              }
+            }
+          ]
+        };
+      }
+    }) as any;
+
+  try {
+    await main([
+      "--model",
+      "model-x",
+      "--prompts",
+      promptsPath,
+      "--out",
+      outPath,
+      "--api",
+      "https://example.com/api/v1",
+      "--no-progress"
+    ]);
+  } finally {
+    process.env.API_KEY = originalApiKey;
+  }
+
+  const output = await readFile(outPath, "utf8");
+  assert.equal(output.trim().length > 0, true);
+  const row = JSON.parse(output.trim());
+  assert.deepEqual(row, {
+    messages: [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "answer", thinking: "reasoning here" }
+    ]
+  });
+});
+
+test("main writes legacy assistant format with --save-old-format", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "datagen-"));
+  const promptsPath = join(dir, "prompts.txt");
+  const outPath = join(dir, "dataset.jsonl");
+  await writeFile(promptsPath, "hello\n");
+
+  const originalApiKey = process.env.API_KEY;
+  process.env.API_KEY = "KEY";
+
+  globalThis.fetch = async () =>
+    ({
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "answer",
+                reasoning: "reasoning here"
+              }
+            }
+          ]
+        };
+      }
+    }) as any;
+
+  try {
+    await main([
+      "--model",
+      "model-x",
+      "--prompts",
+      promptsPath,
+      "--out",
+      outPath,
+      "--api",
+      "https://example.com/api/v1",
+      "--save-old-format",
+      "--no-progress"
+    ]);
+  } finally {
+    process.env.API_KEY = originalApiKey;
+  }
+
+  const output = await readFile(outPath, "utf8");
+  assert.equal(output.trim().length > 0, true);
+  const row = JSON.parse(output.trim());
+  assert.deepEqual(row, {
+    messages: [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "<think>reasoning here</think>\nanswer" }
+    ]
+  });
 });
 
 test("ensureReadableFile throws if missing or not a file", async () => {
