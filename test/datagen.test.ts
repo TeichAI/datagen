@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,8 +8,12 @@ import {
   buildRequestMessages,
   buildOutputMessages,
   formatAssistantContent,
+  formatAssistantContentOld,
+  generateDatasetReadmeTemplate,
+  resolveDatasetReadmePath,
   callOpenRouter,
-  ensureReadableFile
+  ensureReadableFile,
+  main
 } from "../src/index.js";
 
 test("parseArgs requires model and prompts", () => {
@@ -58,6 +62,30 @@ test("parseArgs parses --reasoningEffort", () => {
     "high"
   ]);
   assert.equal(args.reasoningEffort, "high");
+});
+
+test("parseArgs parses --save-old-format from CLI", () => {
+  const args = parseArgs([
+    "--model",
+    "m",
+    "--prompts",
+    "p.txt",
+    "--save-old-format"
+  ]);
+  assert.equal(args.saveOldFormat, true);
+});
+
+test("parseArgs parses --dataset-readme", () => {
+  const args = parseArgs([
+    "--model",
+    "m",
+    "--prompts",
+    "p.txt",
+    "--out",
+    "nested/out.jsonl",
+    "--dataset-readme"
+  ]);
+  assert.match(args.datasetReadmePath ?? "", /nested\/DATASET_README\.md$/);
 });
 
 test("parseArgs parses --openrouter.isFree", () => {
@@ -111,6 +139,7 @@ test("parseArgs supports --config YAML", async () => {
   assert.equal(args.openrouterProviderSort, "throughput");
   assert.equal(args.reasoningEffort, "high");
   assert.equal(args.progress, false);
+  assert.equal(args.saveOldFormat, false);
 });
 
 test("parseArgs lets CLI override config", async () => {
@@ -120,6 +149,28 @@ test("parseArgs lets CLI override config", async () => {
   const args = parseArgs(["--config", configPath, "--model", "b"]);
   assert.equal(args.model, "b");
   assert.equal(args.promptsPath, "p.txt");
+});
+
+test("parseArgs ignores save-old-format in config and only honors CLI", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "datagen-"));
+  const configPath = join(dir, "config.yaml");
+  await writeFile(
+    configPath,
+    ["model: a", "prompts: p.txt", "save-old-format: true", ""].join("\n")
+  );
+
+  const fromConfigOnly = parseArgs(["--config", configPath]);
+  assert.equal(fromConfigOnly.saveOldFormat, false);
+
+  const fromCli = parseArgs(["--config", configPath, "--save-old-format"]);
+  assert.equal(fromCli.saveOldFormat, true);
+});
+
+test("resolveDatasetReadmePath handles booleans and custom paths", () => {
+  assert.equal(resolveDatasetReadmePath(undefined, "dataset.jsonl"), null);
+  assert.match(resolveDatasetReadmePath(true, "nested/out.jsonl") ?? "", /nested\/DATASET_README\.md$/);
+  assert.equal(resolveDatasetReadmePath(false, "nested/out.jsonl"), null);
+  assert.match(resolveDatasetReadmePath("custom/README.md", "nested/out.jsonl") ?? "", /custom\/README\.md$/);
 });
 
 test("buildRequestMessages omits system when empty", () => {
@@ -144,7 +195,61 @@ test("buildOutputMessages respects storeSystem flag", () => {
 
 test("formatAssistantContent wraps reasoning in <think>", () => {
   const out = formatAssistantContent("answer", "reasoning here");
+  assert.deepEqual(out, { content: "answer", thinking: "reasoning here" });
+});
+
+test("formatAssistantContentOld wraps reasoning in <think>", () => {
+  const out = formatAssistantContentOld("answer", "reasoning here");
   assert.equal(out, "<think>reasoning here</think>\nanswer");
+});
+
+test("buildOutputMessages includes thinking when present", () => {
+  const messages = buildOutputMessages("sys", "u", "a", true, "reasoning here");
+  assert.deepEqual(messages, [
+    { role: "system", content: "sys" },
+    { role: "user", content: "u" },
+    { role: "assistant", content: "a", thinking: "reasoning here" }
+  ]);
+});
+
+test("buildOutputMessages uses legacy assistant format when requested", () => {
+  const messages = buildOutputMessages("sys", "u", "a", true, "reasoning here", true);
+  assert.deepEqual(messages, [
+    { role: "system", content: "sys" },
+    { role: "user", content: "u" },
+    { role: "assistant", content: "<think>reasoning here</think>\na" }
+  ]);
+});
+
+test("generateDatasetReadmeTemplate reflects the aligned chat format", () => {
+  const readme = generateDatasetReadmeTemplate({
+    model: "openai/gpt-4o-mini",
+    apiBase: "https://openrouter.ai/api/v1",
+    outPath: "/tmp/my_dataset.jsonl",
+    rowCount: 887,
+    systemPrompt: "You are a helpful assistant",
+    storeSystem: true,
+    reasoningEffort: "high",
+    saveOldFormat: false
+  });
+  assert.match(readme, /Assistant reasoning is stored in a separate `thinking` field/);
+  assert.match(readme, /"thinking": "\.\.\."/);
+  assert.match(readme, /Rows: 887/);
+});
+
+test("generateDatasetReadmeTemplate reflects the legacy assistant format", () => {
+  const readme = generateDatasetReadmeTemplate({
+    model: "openai/gpt-4o-mini",
+    apiBase: "https://openrouter.ai/api/v1",
+    outPath: "/tmp/my_dataset.jsonl",
+    rowCount: 887,
+    systemPrompt: "You are a helpful assistant",
+    storeSystem: true,
+    reasoningEffort: "high",
+    saveOldFormat: true
+  });
+  assert.match(readme, /legacy `<think>` tags/);
+  assert.match(readme, /<think>\.\.\.<\/think>\\n\.\.\./);
 });
 
 test("callOpenRouter sends correct payload and parses reasoning", async () => {
@@ -306,6 +411,115 @@ test("callOpenRouter reasoning.effort works for non-OpenRouter apiBase", async (
   assert.equal(calls.length, 1);
   const body = JSON.parse(calls[0].init.body);
   assert.deepEqual(body.reasoning, { effort: "minimal" });
+});
+
+test("main writes new assistant format by default", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "datagen-"));
+  const promptsPath = join(dir, "prompts.txt");
+  const outPath = join(dir, "dataset.jsonl");
+  await writeFile(promptsPath, "hello\n");
+
+  const originalApiKey = process.env.API_KEY;
+  process.env.API_KEY = "KEY";
+
+  globalThis.fetch = async () =>
+    ({
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "answer",
+                reasoning: "reasoning here"
+              }
+            }
+          ]
+        };
+      }
+    }) as any;
+
+  try {
+    await main([
+      "--model",
+      "model-x",
+      "--prompts",
+      promptsPath,
+      "--out",
+      outPath,
+      "--api",
+      "https://example.com/api/v1",
+      "--no-progress"
+    ]);
+  } finally {
+    process.env.API_KEY = originalApiKey;
+  }
+
+  const output = await readFile(outPath, "utf8");
+  assert.equal(output.trim().length > 0, true);
+  const row = JSON.parse(output.trim());
+  assert.deepEqual(row, {
+    messages: [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "answer", thinking: "reasoning here" }
+    ]
+  });
+});
+
+test("main writes legacy assistant format with --save-old-format", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "datagen-"));
+  const promptsPath = join(dir, "prompts.txt");
+  const outPath = join(dir, "dataset.jsonl");
+  await writeFile(promptsPath, "hello\n");
+
+  const originalApiKey = process.env.API_KEY;
+  process.env.API_KEY = "KEY";
+
+  globalThis.fetch = async () =>
+    ({
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "answer",
+                reasoning: "reasoning here"
+              }
+            }
+          ]
+        };
+      }
+    }) as any;
+
+  try {
+    await main([
+      "--model",
+      "model-x",
+      "--prompts",
+      promptsPath,
+      "--out",
+      outPath,
+      "--api",
+      "https://example.com/api/v1",
+      "--save-old-format",
+      "--no-progress"
+    ]);
+  } finally {
+    process.env.API_KEY = originalApiKey;
+  }
+
+  const output = await readFile(outPath, "utf8");
+  assert.equal(output.trim().length > 0, true);
+  const row = JSON.parse(output.trim());
+  assert.deepEqual(row, {
+    messages: [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "<think>reasoning here</think>\nanswer" }
+    ]
+  });
 });
 
 test("ensureReadableFile throws if missing or not a file", async () => {
