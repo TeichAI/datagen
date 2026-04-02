@@ -8,9 +8,6 @@ import {
   buildRequestMessages,
   buildOutputMessages,
   formatAssistantContent,
-  formatAssistantContentOld,
-  generateDatasetReadmeTemplate,
-  resolveDatasetReadmePath,
   callOpenRouter,
   ensureReadableFile,
   main
@@ -25,7 +22,6 @@ test("parseArgs requires model and prompts", () => {
 test("parseArgs defaults store-system to true", () => {
   const args = parseArgs(["--model", "m", "--prompts", "p.txt"]);
   assert.equal(args.storeSystem, true);
-  assert.equal(args.datasetReadmePath, null);
 });
 
 test("parseArgs defaults concurrent to 1", () => {
@@ -194,7 +190,7 @@ test("buildOutputMessages respects storeSystem flag", () => {
   ]);
 });
 
-test("formatAssistantContent stores reasoning in thinking", () => {
+test("formatAssistantContent wraps reasoning in <think>", () => {
   const out = formatAssistantContent("answer", "reasoning here");
   assert.deepEqual(out, { content: "answer", thinking: "reasoning here" });
 });

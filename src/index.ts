@@ -1,6 +1,6 @@
 import { createReadStream, createWriteStream, promises as fs } from "node:fs";
 import { createInterface } from "node:readline";
-import { basename, dirname, extname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { countNonEmptyLines, ProgressBar } from "./progress.js";
 import { loadConfigRawArgs } from "./config.js";
 import {
@@ -122,7 +122,6 @@ export type Args = {
   model: string;
   promptsPath: string;
   outPath: string;
-  datasetReadmePath: string | null;
   apiBase: string;
   systemPrompt: string;
   storeSystem: boolean;
@@ -297,10 +296,6 @@ function parseArgsFromRaw(args: Record<string, string | boolean>): Args {
   const model = (args.model as string) || "";
   const promptsPath = (args.prompts as string) || "";
   const outPath = (args.out as string) || "dataset.jsonl";
-  const datasetReadmePath = resolveDatasetReadmePath(
-    args["dataset-readme"] ?? args.datasetReadme,
-    outPath
-  );
   const apiBase = (args.api as string) || "https://openrouter.ai/api/v1";
   const systemPrompt = (args.system as string) || "";
   const storeSystemRaw = args["store-system"];
@@ -382,7 +377,6 @@ function parseArgsFromRaw(args: Record<string, string | boolean>): Args {
     model,
     promptsPath,
     outPath,
-    datasetReadmePath,
     apiBase,
     systemPrompt,
     storeSystem,
@@ -433,6 +427,12 @@ export function buildRequestMessages(
     : [{ role: "user" as const, content: userPrompt }];
 }
 
+export function formatAssistantContent(content: string, reasoning?: string) {
+  return typeof reasoning === "string" && reasoning.trim().length > 0
+    ? `<think>${reasoning}</think>\n${content}`
+    : content;
+}
+
 export function buildOutputMessages(
   systemPrompt: string,
   userPrompt: string,
@@ -447,12 +447,12 @@ export function buildOutputMessages(
     return [
       { role: "system" as const, content: systemPrompt },
       { role: "user" as const, content: userPrompt },
-      assistantMessage
+      { role: "assistant" as const, content: assistantContent }
     ];
   }
   return [
     { role: "user" as const, content: userPrompt },
-    assistantMessage
+    { role: "assistant" as const, content: assistantContent }
   ];
 }
 
@@ -582,7 +582,6 @@ export async function main(argv = process.argv.slice(2)) {
     model,
     promptsPath,
     outPath,
-    datasetReadmePath,
     apiBase,
     systemPrompt,
     storeSystem,
@@ -781,7 +780,7 @@ export async function main(argv = process.argv.slice(2)) {
     writeQueue = writeQueue.then(
       () =>
         new Promise<void>((resolve, reject) => {
-          out.write(line, (err?: Error | null) => {
+          out.write(line, (err) => {
             if (err) reject(err);
             else resolve();
           });
@@ -838,6 +837,7 @@ export async function main(argv = process.argv.slice(2)) {
           spentUsd += calculateOpenRouterSpendUSD(pricing, usage);
         }
 
+        const assistantContent = formatAssistantContent(content, reasoning);
         const messages = buildOutputMessages(
           systemPrompt,
           prompt,
