@@ -8,6 +8,9 @@ import {
   buildRequestMessages,
   buildOutputMessages,
   formatAssistantContent,
+  formatAssistantContentOld,
+  generateDatasetReadmeTemplate,
+  resolveDatasetReadmePath,
   callOpenRouter,
   ensureReadableFile,
   main
