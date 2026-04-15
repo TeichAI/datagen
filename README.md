@@ -1,8 +1,8 @@
-# DataGen - By TeichAI
+# DataGen – By TeichAI
 
-A easy to use CLI to generate JSONL datasets from a TXT file using LLMs.
+A simple CLI to generate JSONL datasets from a text file using LLMs.
 
-## Install
+## Installation
 
 ```bash
 npm i -g @teichai/datagen
@@ -21,7 +21,7 @@ Run tests:
 npm test
 ```
 
-## Usage
+## Quick Start
 
 Set your OpenRouter API key:
 
@@ -29,22 +29,22 @@ Set your OpenRouter API key:
 export API_KEY="your_openrouter_key"
 ```
 
-Create a prompts file where each line is a prompt:
+Create a `prompts.txt` file where each line is a prompt:
 
-```text
+```
 Explain the CAP theorem in simple terms.
 Write a Python function to reverse a linked list.
 ```
 
-Run:
+Run the CLI:
 
 ```bash
 datagen --model openai/gpt-4o-mini --prompts prompts.txt
 ```
 
-### Configuration File
+## Configuration File
 
-You can also use a YAML config file:
+You can also use a YAML config file. Example:
 
 ```yaml
 model: openai/gpt-4o-mini
@@ -61,28 +61,32 @@ Run with:
 datagen --config config.yaml
 ```
 
-Note: On startup, `datagen` does a quick best-effort check for a newer npm version and prints an upgrade command if available. Disable with `DATAGEN_DISABLE_UPDATE_CHECK=1`.
+## Options
 
-Development (build + run once):
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--help` | Show help message | – |
+| `--version` | Print CLI version | – |
+| `--config <file>` | Path to config file | – |
+| `--model <name>` | Model name (required) | – |
+| `--prompts <file>` | Prompts file (required) | – |
+| `--out <file>` | Output JSONL | `dataset.jsonl` |
+| `--api <baseUrl>` | API base URL | OpenRouter |
+| `--system <text>` | System prompt | – |
+| `--store-system <true|false>` | Store system message in output | `true` |
+| `--concurrent <num>` | Number of concurrent requests | `1` |
+| `--openrouter.provider <slugs>` | Provider slugs order (OpenRouter only) | – |
+| `--openrouter.providerSort <price|throughput|latency>` | Provider routing sort (OpenRouter only) | – |
+| `--reasoningEffort <none|minimal|low|medium|high|xhigh>` | Reasoning effort | – |
+| `--no-progress` | Disable progress bar | – |
+| `--timeout <ms>` | Request timeout in ms | – |
+
+## Development
 
 ```bash
 API_KEY="your_openrouter_key" npm run dev -- --model openai/gpt-4o-mini --prompts prompts.txt
 ```
 
-### Options
+## Update Check
 
-- `--help`: show the help message and exit.
-- `--version`: print the CLI version and exit.
-- `--config`: set a config file
-- `--model <name>`: required model name.
-- `--prompts <file>`: required prompts file.
-- `--out <file>`: output JSONL (default `dataset.jsonl`).
-- `--api <baseUrl>`: API base (default OpenRouter).
-- `--system <text>`: optional system prompt.
-- `--store-system true|false`: store system message in output (default `true`).
-- `--concurrent <num>`: number of in-flight requests (default `1`).
-- `--openrouter.provider <slugs>`: comma-separated provider slugs to try in order (OpenRouter only).
-- `--openrouter.providerSort <price|throughput|latency>`: provider routing sort (OpenRouter only).
-- `--reasoningEffort <none|minimal|low|medium|high|xhigh>`: pass through as `reasoning.effort`.
-- `--no-progress`: disable the progress bar.
-- `--timeout <ms>`: request timeout in milliseconds.
+On startup, `datagen` performs a quick check for a newer npm version and prints an upgrade command if available. Disable with `DATAGEN_DISABLE_UPDATE_CHECK=1`.
